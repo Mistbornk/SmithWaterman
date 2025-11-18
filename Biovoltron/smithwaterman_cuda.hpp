@@ -15,6 +15,13 @@ namespace biovoltron {
  * 
  */
 struct SmithWatermanCuda {
+
+  struct SWResult {
+      int offset; 
+      Cigar cigar;
+      int score;
+  };
+
   /**
    * @brief Parameters for scoring alignment.
    *
@@ -58,10 +65,8 @@ struct SmithWatermanCuda {
   static auto
   align(std::string_view ref, std::string_view alt,
         Parameters params = NEW_SW_PARAMETERS)
-    -> std::pair<int, Cigar>; 
+    -> SWResult; 
   
-
-  // future work: for batch(?)
 };
 
 } // namespace biovoltron

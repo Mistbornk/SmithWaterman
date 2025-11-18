@@ -3,19 +3,32 @@
 #include "catch.hpp"
 #include <chrono>
 #include <iostream>
-
+#include <fstream>
 using namespace biovoltron;
 
 TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWaterman]") 
 {
-  // Original reference DNA sequence (162 bases)
-  std::string ref = 
-    "AATCGAAGGTCGTAAGGACACGGTTGAGCGTTCAGCGTTCATGTGAGTCCTCACCACTTATGGCTCCATAGCCT"
-    "GCTATTTAAGTGGGTTACCGGTCTCCGCCAAGTAGCTGGTGTAAGAACACAGTAACTGAGCCCAGTGTGATCAG"
-    "CCCTAACGAGGTAC";
+    // define in cmake
+    std::string data_path = DATA_PATH;
 
-  // Copy the reference sequence into alt (used as the query/read)
-  auto alt = ref;
+    // read ref.fasta
+    std::ifstream fref(data_path + "/ref.fasta");
+    REQUIRE(fref.good());
+
+    std::string line, ref;
+    while (std::getline(fref, line)) {
+        if (!line.empty() && line[0] != '>') ref += line;
+    }
+
+    // read alt.fasta
+    std::ifstream falt(data_path + "/alt.fasta");
+    REQUIRE(falt.good());
+
+    std::string alt, line_alt;
+    while (std::getline(falt, line_alt)) {
+        if (!line_alt.empty() && line_alt[0] != '>') alt += line_alt;
+    }
+    REQUIRE(ref.size() == alt.size());
 
   SECTION("Same reads") 
   {
@@ -124,14 +137,27 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
 
 TEST_CASE("SmithWatermanCuda::align - Performs Smith-Waterman alignment", "[SmithWaterman]") 
 {
-  // Original reference DNA sequence (162 bases)
-  std::string ref = 
-    "AATCGAAGGTCGTAAGGACACGGTTGAGCGTTCAGCGTTCATGTGAGTCCTCACCACTTATGGCTCCATAGCCT"
-    "GCTATTTAAGTGGGTTACCGGTCTCCGCCAAGTAGCTGGTGTAAGAACACAGTAACTGAGCCCAGTGTGATCAG"
-    "CCCTAACGAGGTAC";
+  // define in cmake
+  std::string data_path = DATA_PATH;
 
-  // Copy the reference sequence into alt (used as the query/read)
-  auto alt = ref;
+  // read ref.fasta
+  std::ifstream fref(data_path + "/ref.fasta");
+  REQUIRE(fref.good());
+
+  std::string line, ref;
+  while (std::getline(fref, line)) {
+      if (!line.empty() && line[0] != '>') ref += line;
+  }
+
+  // read alt.fasta
+  std::ifstream falt(data_path + "/alt.fasta");
+  REQUIRE(falt.good());
+
+  std::string alt, line_alt;
+  while (std::getline(falt, line_alt)) {
+      if (!line_alt.empty() && line_alt[0] != '>') alt += line_alt;
+  }
+  REQUIRE(ref.size() == alt.size());
 
   SECTION("Same reads") 
   {

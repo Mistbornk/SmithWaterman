@@ -55,6 +55,17 @@ struct SmithWatermanCuda {
    * @param params Alignment parameters (optional).
    * @return Pair of alignment offset and CIGAR string.
    */
+  static bool well_match(std::string_view ref, std::string_view alt) {
+    int mismatch = 0;
+    for (std::size_t i = 0;
+         mismatch <= MAX_MISMATCHES && i < ref.size();
+         ++i) {
+      if (alt[i] != ref[i])
+        ++mismatch;
+    }
+    return mismatch <= MAX_MISMATCHES;
+  }
+
   static auto
   align(std::string_view ref, std::string_view alt,
         Parameters params = NEW_SW_PARAMETERS)

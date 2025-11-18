@@ -23,7 +23,11 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
                                       const char* alt, int alt_len,
                                       int w_match, int w_mismatch,
                                       int w_open, int w_extend,
-                                      int* score, int* trace)
+                                      int* score, int* trace,
+                                      int* gap_size_down,
+                                      int* best_gap_down,
+                                      int* gap_size_right,
+                                      int* best_gap_right)
 {
   // 暫時只讓 thread 0 做事
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
@@ -43,12 +47,7 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
     }
   }
 
-  // gap tracking arrays（和 CPU 版相同邏輯）
-  // 這裡用 new/delete，在 baseline 版先不考慮效率
-  int* gap_size_down   = new int[cols + 1];
-  int* best_gap_down   = new int[cols + 1];
-  int* gap_size_right  = new int[rows + 1];
-  int* best_gap_right  = new int[rows + 1];
+  // gap tracking arrays（和 CPU 版相同邏輯），由 host 配好記憶體，這裡只初始化
 
   const int NEG_INF = INT_MIN / 2;
 
@@ -104,11 +103,6 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
       }
     }
   }
-
-  delete[] gap_size_down;
-  delete[] best_gap_down;
-  delete[] gap_size_right;
-  delete[] best_gap_right;
 }
 
 // ----------------- Host-side traceback (flattened) -----------------
@@ -248,10 +242,21 @@ auto SmithWatermanCuda::align(std::string_view ref, std::string_view alt,
   int*  d_score = nullptr;
   int*  d_trace = nullptr;
 
+  int*  d_gap_size_down  = nullptr;
+  int*  d_best_gap_down  = nullptr;
+  int*  d_gap_size_right = nullptr;
+  int*  d_best_gap_right = nullptr;
+
   check_cuda(cudaMalloc(&d_ref, ref_len * sizeof(char)), "cudaMalloc d_ref");
   check_cuda(cudaMalloc(&d_alt, alt_len * sizeof(char)), "cudaMalloc d_alt");
   check_cuda(cudaMalloc(&d_score, mat_size * sizeof(int)), "cudaMalloc d_score");
   check_cuda(cudaMalloc(&d_trace, mat_size * sizeof(int)), "cudaMalloc d_trace");
+
+  // gap arrays 長度：down 按 j (col)、right 按 i (row)
+  check_cuda(cudaMalloc(&d_gap_size_down,  (cols + 1) * sizeof(int)), "cudaMalloc gap_size_down");
+  check_cuda(cudaMalloc(&d_best_gap_down,  (cols + 1) * sizeof(int)), "cudaMalloc best_gap_down");
+  check_cuda(cudaMalloc(&d_gap_size_right, (rows + 1) * sizeof(int)), "cudaMalloc gap_size_right");
+  check_cuda(cudaMalloc(&d_best_gap_right, (rows + 1) * sizeof(int)), "cudaMalloc best_gap_right");
 
   check_cuda(cudaMemcpy(d_ref, ref.data(), ref_len * sizeof(char),
                         cudaMemcpyHostToDevice),
@@ -268,7 +273,9 @@ auto SmithWatermanCuda::align(std::string_view ref, std::string_view alt,
       d_alt, alt_len,
       params.w_match, params.w_mismatch,
       params.w_open, params.w_extend,
-      d_score, d_trace);
+      d_score, d_trace,
+      d_gap_size_down, d_best_gap_down,
+      d_gap_size_right, d_best_gap_right);
 
   check_cuda(cudaGetLastError(), "kernel launch");
   check_cuda(cudaDeviceSynchronize(), "kernel sync");
@@ -286,6 +293,10 @@ auto SmithWatermanCuda::align(std::string_view ref, std::string_view alt,
   cudaFree(d_alt);
   cudaFree(d_score);
   cudaFree(d_trace);
+  cudaFree(d_gap_size_down);
+  cudaFree(d_best_gap_down);
+  cudaFree(d_gap_size_right);
+  cudaFree(d_best_gap_right);
 
   return traceback_and_build_cigar(h_score, h_trace, ref_len, alt_len);
 }

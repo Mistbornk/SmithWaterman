@@ -150,10 +150,10 @@ void sw_warp_kernel(const char* __restrict__ ref,
         +---+---+---+---+---+---+---+---+---+---+---+
         ...
         +---+---+---+---+---+---+---+---+---+---+---+
-        ^   ^   ^                                   ^
-        |   |   |                                   |
-Thread  1   2   3       ...                 Thread 32
-(wi =   1   2   3       ...                     wi=32)
+        ^           ^   ^                                   ^
+        |           |   |                                   |
+Thread  1           2   3       ...                 Thread 32
+(wi =   1           2   3       ...                     wi=32)
     */
     // Through query (alt) do  WARP_SIZE stripe
     for (int warp_block = 0; warp_block < M; warp_block += WARP_SIZE)
@@ -342,8 +342,10 @@ auto SmithWatermanCuda::align(std::string_view ref,
     //  0. Fixed aligmnet bug: 還沒找到為什麼有時候分數跟 baseline 不一樣
     //  1. 根據 sink (最佳 j,i) 做 traceback，計算真正的 offset 與 CIGAR, return SWResult, 把 best_score / offset / cigar 填進去
     //  2. 提升 GPU 利用率, 新增 batch align: 一次可以同時跑許多 align pair (ref vs. alt), 目前只用到 warp size 個 block 做一個 align pair
-    //
-    return SWResult{};
+    //  
+    //  3. XSIMD/XSIMD batch, baseline batch (thread), input: vector<string> ref, vector<string> alt, aligmnet pair ref[i] vs. alt[i]
+    //  
+    return SWResult{offset, cigar, best score};
 }
 
 } // namespace biovoltron

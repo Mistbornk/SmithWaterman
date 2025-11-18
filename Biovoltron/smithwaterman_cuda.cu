@@ -19,7 +19,7 @@ static inline void check_cuda(cudaError_t err, const char* msg) {
 
 // --- CUDA kernel ---
 // Batched 版：一個 block 負責一個 alignment，
-// 目前仍由 thread 0 在 block 裡跑 CPU 版 double-loop（後續可再細化平行化）
+// 目前仍由 thread 0 在 block 裡跑 DP + traceback（之後可以再做 finer-grained 平行化）
 __global__ void smith_waterman_kernel(const char* all_refs,
                                       const char* all_alts,
                                       int ref_len, int alt_len,
@@ -30,7 +30,14 @@ __global__ void smith_waterman_kernel(const char* all_refs,
                                       int* all_best_gap_down,
                                       int* all_gap_size_right,
                                       int* all_best_gap_right,
-                                      int n_alignments)
+                                      // CIGAR 輸出相關
+                                      unsigned* all_cigar_lens,
+                                      char*     all_cigar_ops,
+                                      int*      cigar_start,
+                                      int*      cigar_count,
+                                      int*      align_offsets,
+                                      int       max_cigar_ops,
+                                      int       n_alignments)
 {
   const int aln = blockIdx.x;
   if (aln >= n_alignments)
@@ -54,6 +61,9 @@ __global__ void smith_waterman_kernel(const char* all_refs,
   int* best_gap_down  = all_best_gap_down  + static_cast<std::size_t>(aln) * (cols + 1);
   int* gap_size_right = all_gap_size_right + static_cast<std::size_t>(aln) * (rows + 1);
   int* best_gap_right = all_best_gap_right + static_cast<std::size_t>(aln) * (rows + 1);
+
+  // 這個 alignment 對應的 CIGAR 區段
+  const int cigar_base = aln * max_cigar_ops;
 
   auto idx = [cols](int i, int j) {
     return i * cols + j;
@@ -79,6 +89,7 @@ __global__ void smith_waterman_kernel(const char* all_refs,
     best_gap_right[i] = NEG_INF;
   }
 
+  // --- DP 填表 ---
   for (int i = 1; i < rows; ++i) {
     for (int j = 1; j < cols; ++j) {
       const int diag_score = score[idx(i - 1, j - 1)];
@@ -122,26 +133,14 @@ __global__ void smith_waterman_kernel(const char* all_refs,
       }
     }
   }
-}
 
-// ----------------- Host-side traceback (flattened) -----------------
-
-static std::pair<int, Cigar>
-traceback_and_build_cigar(const int* score,
-                          const int* trace,
-                          int ref_len, int alt_len)
-{
-  const int rows = ref_len + 1;
-  const int cols = alt_len + 1;
-
-  auto idx = [cols](int i, int j) {
-    return i * cols + j;
-  };
+  // --- 在 GPU 上做 traceback + CIGAR 產生 ---
 
   const int ref_size = ref_len;
   const int alt_size = alt_len;
 
-  int max_score = std::numeric_limits<int>::min();
+  // ⬅ 這裡原本用 std::numeric_limits<int>::min()，改成 INT_MIN 避免 NVCC 錯誤
+  int max_score = INT_MIN;
   int segment_len = 0;
 
   // 從最後一欄找最大 score
@@ -171,14 +170,30 @@ traceback_and_build_cigar(const int* score,
     }
   }
 
-  Cigar cigar{};
+  // 我們會把 CIGAR 元素寫到 global array 的尾端往前寫：
+  //   先寫出「反向」CIGAR（像 CPU 版的 vector），
+  //   再利用從尾端往前寫的方式，讓 host 讀出時自動變成正向。
+  int write_pos = max_cigar_ops - 1;
+  int elem_count = 0;
+
+  auto emit_cigar = [&](unsigned len, char op) {
+    if (len == 0) return;
+    if (write_pos < 0) return;  // 避免 out-of-bounds；實務上 max_cigar_ops 要設夠大
+    all_cigar_lens[cigar_base + write_pos] = len;
+    all_cigar_ops[cigar_base + write_pos] = op;
+    --write_pos;
+    ++elem_count;
+  };
+
+  // 若尾端有 overhang → 先寫一個 'S'
   if (segment_len > 0) {
-    cigar.emplace_back(static_cast<unsigned>(segment_len), 'S');
+    emit_cigar(static_cast<unsigned>(segment_len), 'S');
     segment_len = 0;
   }
 
   char state = 'M';
 
+  // 主 traceback loop
   do {
     const int cur_trace = trace[idx(pos_i, pos_j)];
     char new_state;
@@ -213,23 +228,29 @@ traceback_and_build_cigar(const int* score,
     if (new_state == state) {
       segment_len += step_size;
     } else {
-      if (segment_len > 0)
-        cigar.emplace_back(static_cast<unsigned>(segment_len), state);
+      emit_cigar(static_cast<unsigned>(segment_len), state);
       segment_len = step_size;
       state = new_state;
     }
   } while (pos_i > 0 && pos_j > 0);
 
-  if (segment_len > 0)
-    cigar.emplace_back(static_cast<unsigned>(segment_len), state);
+  // 最後累積的 segment
+  emit_cigar(static_cast<unsigned>(segment_len), state);
 
   const int align_offset = pos_i;
 
-  if (pos_j > 0)
-    cigar.emplace_back(static_cast<unsigned>(pos_j), 'S');
+  // 如果 alt 還有剩 → leading soft-clip
+  if (pos_j > 0) {
+    emit_cigar(static_cast<unsigned>(pos_j), 'S');
+  }
 
-  cigar.reverse();
-  return std::make_pair(align_offset, cigar);
+  // 此時 emit 出來的序列順序是「反向」，但我們是從陣列尾端往前寫，
+  // 例如 L0, L1, L2 寫到 positions: ..., 9,8,7，
+  // host 會從 start = 7, len = 3，依序讀 7,8,9 => L2, L1, L0，
+  // 正好就是正向的 CIGAR。
+  cigar_start[aln]   = write_pos + 1;
+  cigar_count[aln]   = elem_count;
+  align_offsets[aln] = align_offset;
 }
 
 // ----------------- Batched interface -----------------
@@ -258,6 +279,10 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
   const int cols = static_cast<int>(alt_len) + 1;
   const std::size_t mat_size = static_cast<std::size_t>(rows) * cols;
 
+  // 為了安全，CIGAR 最多可能是 ref_len + alt_len + 2 個 element
+  // （全 I + 全 D + 兩個 S 等極端情形）
+  const int max_cigar_ops = static_cast<int>(ref_len + alt_len + 2);
+
   // host flattened buffers
   std::vector<char> h_ref_all(n * ref_len);
   std::vector<char> h_alt_all(n * alt_len);
@@ -268,9 +293,6 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
     std::copy_n(tasks[i].alt.data(), alt_len,
                 h_alt_all.data() + static_cast<std::size_t>(i) * alt_len);
   }
-
-  std::vector<int> h_score_all(n * mat_size, 0);
-  std::vector<int> h_trace_all(n * mat_size, 0);
 
   // device buffers
   char* d_ref_all = nullptr;
@@ -283,14 +305,27 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
   int*  d_gap_size_right_all = nullptr;
   int*  d_best_gap_right_all = nullptr;
 
+  unsigned* d_cigar_lens = nullptr;
+  char*     d_cigar_ops  = nullptr;
+  int*      d_cigar_start = nullptr;
+  int*      d_cigar_count = nullptr;
+  int*      d_align_offsets = nullptr;
+
   const std::size_t ref_bytes = h_ref_all.size() * sizeof(char);
   const std::size_t alt_bytes = h_alt_all.size() * sizeof(char);
-  const std::size_t mat_bytes = h_score_all.size() * sizeof(int);
+
+  // score/trace matrix（只在 device 使用，不會拷回 host）
+  const std::size_t mat_bytes_all = static_cast<std::size_t>(n) * mat_size * sizeof(int);
+
+  // CIGAR 緩衝區總大小
+  const std::size_t cigar_total_ops = static_cast<std::size_t>(n) * max_cigar_ops;
+  const std::size_t cigar_lens_bytes = cigar_total_ops * sizeof(unsigned);
+  const std::size_t cigar_ops_bytes  = cigar_total_ops * sizeof(char);
 
   check_cuda(cudaMalloc(&d_ref_all, ref_bytes), "cudaMalloc d_ref_all");
   check_cuda(cudaMalloc(&d_alt_all, alt_bytes), "cudaMalloc d_alt_all");
-  check_cuda(cudaMalloc(&d_score_all, mat_bytes), "cudaMalloc d_score_all");
-  check_cuda(cudaMalloc(&d_trace_all, mat_bytes), "cudaMalloc d_trace_all");
+  check_cuda(cudaMalloc(&d_score_all, mat_bytes_all), "cudaMalloc d_score_all");
+  check_cuda(cudaMalloc(&d_trace_all, mat_bytes_all), "cudaMalloc d_trace_all");
 
   // gap arrays：每個 alignment 各有 (cols+1) / (rows+1) 長度
   check_cuda(cudaMalloc(&d_gap_size_down_all,
@@ -305,6 +340,13 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
   check_cuda(cudaMalloc(&d_best_gap_right_all,
                         static_cast<std::size_t>(n) * (rows + 1) * sizeof(int)),
              "cudaMalloc best_gap_right_all");
+
+  // CIGAR device buffer
+  check_cuda(cudaMalloc(&d_cigar_lens, cigar_lens_bytes), "cudaMalloc d_cigar_lens");
+  check_cuda(cudaMalloc(&d_cigar_ops,  cigar_ops_bytes),  "cudaMalloc d_cigar_ops");
+  check_cuda(cudaMalloc(&d_cigar_start, n * sizeof(int)), "cudaMalloc d_cigar_start");
+  check_cuda(cudaMalloc(&d_cigar_count, n * sizeof(int)), "cudaMalloc d_cigar_count");
+  check_cuda(cudaMalloc(&d_align_offsets, n * sizeof(int)), "cudaMalloc d_align_offsets");
 
   check_cuda(cudaMemcpy(d_ref_all, h_ref_all.data(), ref_bytes,
                         cudaMemcpyHostToDevice),
@@ -324,18 +366,39 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
       d_score_all, d_trace_all,
       d_gap_size_down_all, d_best_gap_down_all,
       d_gap_size_right_all, d_best_gap_right_all,
+      d_cigar_lens, d_cigar_ops,
+      d_cigar_start, d_cigar_count,
+      d_align_offsets,
+      max_cigar_ops,
       n);
 
   check_cuda(cudaGetLastError(), "kernel launch");
   check_cuda(cudaDeviceSynchronize(), "kernel sync");
 
-  check_cuda(cudaMemcpy(h_score_all.data(), d_score_all, mat_bytes,
-                        cudaMemcpyDeviceToHost),
-             "cudaMemcpy score_all back");
-  check_cuda(cudaMemcpy(h_trace_all.data(), d_trace_all, mat_bytes,
-                        cudaMemcpyDeviceToHost),
-             "cudaMemcpy trace_all back");
+  // 將 CIGAR 結果帶回 host（比整個 score/trace matrix 小很多）
+  std::vector<unsigned> h_cigar_lens(cigar_total_ops);
+  std::vector<char>     h_cigar_ops(cigar_total_ops);
+  std::vector<int>      h_cigar_start(n);
+  std::vector<int>      h_cigar_count(n);
+  std::vector<int>      h_align_offsets(n);
 
+  check_cuda(cudaMemcpy(h_cigar_lens.data(), d_cigar_lens, cigar_lens_bytes,
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy cigar_lens");
+  check_cuda(cudaMemcpy(h_cigar_ops.data(), d_cigar_ops, cigar_ops_bytes,
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy cigar_ops");
+  check_cuda(cudaMemcpy(h_cigar_start.data(), d_cigar_start, n * sizeof(int),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy cigar_start");
+  check_cuda(cudaMemcpy(h_cigar_count.data(), d_cigar_count, n * sizeof(int),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy cigar_count");
+  check_cuda(cudaMemcpy(h_align_offsets.data(), d_align_offsets, n * sizeof(int),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy align_offsets");
+
+  // 釋放 device memory
   cudaFree(d_ref_all);
   cudaFree(d_alt_all);
   cudaFree(d_score_all);
@@ -344,18 +407,30 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
   cudaFree(d_best_gap_down_all);
   cudaFree(d_gap_size_right_all);
   cudaFree(d_best_gap_right_all);
+  cudaFree(d_cigar_lens);
+  cudaFree(d_cigar_ops);
+  cudaFree(d_cigar_start);
+  cudaFree(d_cigar_count);
+  cudaFree(d_align_offsets);
 
+  // 在 host 上組回 Cigar 物件
   std::vector<std::pair<int, Cigar>> results;
   results.reserve(n);
 
-  for (int i = 0; i < n; ++i) {
-    const int* score_ptr = h_score_all.data() + static_cast<std::size_t>(i) * mat_size;
-    const int* trace_ptr = h_trace_all.data() + static_cast<std::size_t>(i) * mat_size;
+  for (int aln = 0; aln < n; ++aln) {
+    const int base = aln * max_cigar_ops;
+    const int start = h_cigar_start[aln];
+    const int cnt   = h_cigar_count[aln];
 
-    results.push_back(
-      traceback_and_build_cigar(score_ptr, trace_ptr,
-                                static_cast<int>(ref_len),
-                                static_cast<int>(alt_len)));
+    Cigar cigar{};
+    for (int k = 0; k < cnt; ++k) {
+      const int idx = start + k;
+      const unsigned len = h_cigar_lens[base + idx];
+      const char op      = h_cigar_ops[base + idx];
+      cigar.emplace_back(len, op);
+    }
+
+    results.emplace_back(h_align_offsets[aln], std::move(cigar));
   }
 
   return results;

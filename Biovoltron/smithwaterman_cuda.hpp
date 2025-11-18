@@ -12,8 +12,7 @@ namespace biovoltron {
 /**
  * @ingroup align
  *
- * @brief Implements the CUDA Smith-Waterman local alignment algorithm with affine gap penalties .
- * 
+ * @brief Implements the CUDA Smith-Waterman local alignment algorithm with affine gap penalties.
  */
 struct SmithWatermanCuda {
   /**
@@ -85,7 +84,7 @@ struct SmithWatermanCuda {
   static auto
   align(std::string_view ref, std::string_view alt,
         Parameters params = NEW_SW_PARAMETERS)
-    -> std::pair<int, Cigar>; 
+    -> std::pair<int, Cigar>;
 
   /**
    * @brief Align a batch of (ref, alt) pairs in parallel on the GPU.

@@ -6,7 +6,7 @@
 #include <vector>
 #include <limits>
 #include <algorithm>
-#include <climits> 
+#include <climits>
 
 namespace biovoltron {
 
@@ -18,22 +18,42 @@ static inline void check_cuda(cudaError_t err, const char* msg) {
 }
 
 // --- CUDA kernel ---
-// 簡單版：一個 alignment，一個 thread，直接在 device 上跑 CPU 那個 double loop
-__global__ void smith_waterman_kernel(const char* ref, int ref_len,
-                                      const char* alt, int alt_len,
+// Batched 版：一個 block 負責一個 alignment，
+// 目前仍由 thread 0 在 block 裡跑 CPU 版 double-loop（後續可再細化平行化）
+__global__ void smith_waterman_kernel(const char* all_refs,
+                                      const char* all_alts,
+                                      int ref_len, int alt_len,
                                       int w_match, int w_mismatch,
                                       int w_open, int w_extend,
-                                      int* score, int* trace,
-                                      int* gap_size_down,
-                                      int* best_gap_down,
-                                      int* gap_size_right,
-                                      int* best_gap_right)
+                                      int* all_scores, int* all_traces,
+                                      int* all_gap_size_down,
+                                      int* all_best_gap_down,
+                                      int* all_gap_size_right,
+                                      int* all_best_gap_right,
+                                      int n_alignments)
 {
-  // 暫時只讓 thread 0 做事
-  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  const int aln = blockIdx.x;
+  if (aln >= n_alignments)
+    return;
+
+  // 暫時只讓 thread 0 做事；之後可以改成 block 內多 thread 分工
+  if (threadIdx.x != 0)
+    return;
 
   const int rows = ref_len + 1;
   const int cols = alt_len + 1;
+
+  // 針對這個 alignment 的 slice
+  const char* ref = all_refs + static_cast<std::size_t>(aln) * ref_len;
+  const char* alt = all_alts + static_cast<std::size_t>(aln) * alt_len;
+
+  int* score = all_scores + static_cast<std::size_t>(aln) * rows * cols;
+  int* trace = all_traces + static_cast<std::size_t>(aln) * rows * cols;
+
+  int* gap_size_down  = all_gap_size_down  + static_cast<std::size_t>(aln) * (cols + 1);
+  int* best_gap_down  = all_best_gap_down  + static_cast<std::size_t>(aln) * (cols + 1);
+  int* gap_size_right = all_gap_size_right + static_cast<std::size_t>(aln) * (rows + 1);
+  int* best_gap_right = all_best_gap_right + static_cast<std::size_t>(aln) * (rows + 1);
 
   auto idx = [cols](int i, int j) {
     return i * cols + j;
@@ -42,13 +62,12 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
   // 初始化 score / trace
   for (int i = 0; i < rows; ++i) {
     for (int j = 0; j < cols; ++j) {
-      score[idx(i,j)] = 0;
-      trace[idx(i,j)] = 0;
+      score[idx(i, j)] = 0;
+      trace[idx(i, j)] = 0;
     }
   }
 
-  // gap tracking arrays（和 CPU 版相同邏輯），由 host 配好記憶體，這裡只初始化
-
+  // gap tracking arrays（和 CPU 版相同邏輯），由 host 預先配置，只在這裡初始化
   const int NEG_INF = INT_MIN / 2;
 
   for (int j = 0; j <= cols; ++j) {
@@ -62,12 +81,12 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
 
   for (int i = 1; i < rows; ++i) {
     for (int j = 1; j < cols; ++j) {
-      const int diag_score = score[idx(i-1, j-1)];
+      const int diag_score = score[idx(i - 1, j - 1)];
       const int step_diag =
-        diag_score + ((ref[i-1] == alt[j-1]) ? w_match : w_mismatch);
+        diag_score + ((ref[i - 1] == alt[j - 1]) ? w_match : w_mismatch);
 
       // Gap in ref (down)
-      const int gap_open_down = score[idx(i-1, j)] + w_open;
+      const int gap_open_down = score[idx(i - 1, j)] + w_open;
       best_gap_down[j] += w_extend;
       if (gap_open_down > best_gap_down[j]) {
         best_gap_down[j] = gap_open_down;
@@ -79,7 +98,7 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
       const int step_down_size = gap_size_down[j];
 
       // Gap in alt (right)
-      const int gap_open_right = score[idx(i, j-1)] + w_open;
+      const int gap_open_right = score[idx(i, j - 1)] + w_open;
       best_gap_right[i] += w_extend;
       if (gap_open_right > best_gap_right[i]) {
         best_gap_right[i] = gap_open_right;
@@ -92,14 +111,14 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
 
       // pick best: diag > right >= down
       if (step_diag >= step_down && step_diag >= step_right) {
-        score[idx(i,j)] = step_diag;
-        trace[idx(i,j)] = 0;             // Diagonal
+        score[idx(i, j)] = step_diag;
+        trace[idx(i, j)] = 0;                 // Diagonal
       } else if (step_right >= step_down) {
-        score[idx(i,j)] = step_right;
-        trace[idx(i,j)] = -step_right_size; // Insertion (right)
+        score[idx(i, j)] = step_right;
+        trace[idx(i, j)] = -step_right_size;  // Insertion (right)
       } else {
-        score[idx(i,j)] = step_down;
-        trace[idx(i,j)] = step_down_size;   // Deletion (down)
+        score[idx(i, j)] = step_down;
+        trace[idx(i, j)] = step_down_size;    // Deletion (down)
       }
     }
   }
@@ -108,8 +127,8 @@ __global__ void smith_waterman_kernel(const char* ref, int ref_len,
 // ----------------- Host-side traceback (flattened) -----------------
 
 static std::pair<int, Cigar>
-traceback_and_build_cigar(const std::vector<int>& score,
-                          const std::vector<int>& trace,
+traceback_and_build_cigar(const int* score,
+                          const int* trace,
                           int ref_len, int alt_len)
 {
   const int rows = ref_len + 1;
@@ -213,10 +232,140 @@ traceback_and_build_cigar(const std::vector<int>& score,
   return std::make_pair(align_offset, cigar);
 }
 
-// Interface
+// ----------------- Batched interface -----------------
+
+auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
+                                    Parameters params)
+  -> std::vector<std::pair<int, Cigar>>
+{
+  const int n = static_cast<int>(tasks.size());
+  if (n == 0)
+    return {};
+
+  // 目前簡化假設：所有 ref 長度一樣、所有 alt 長度一樣
+  const std::size_t ref_len = tasks.front().ref.size();
+  const std::size_t alt_len = tasks.front().alt.size();
+
+  for (const auto& t : tasks) {
+    if (t.ref.size() != ref_len || t.alt.size() != alt_len) {
+      throw std::runtime_error(
+        "SmithWatermanCuda::align_batch currently requires all refs/alts "
+        "to have the same length");
+    }
+  }
+
+  const int rows = static_cast<int>(ref_len) + 1;
+  const int cols = static_cast<int>(alt_len) + 1;
+  const std::size_t mat_size = static_cast<std::size_t>(rows) * cols;
+
+  // host flattened buffers
+  std::vector<char> h_ref_all(n * ref_len);
+  std::vector<char> h_alt_all(n * alt_len);
+
+  for (int i = 0; i < n; ++i) {
+    std::copy_n(tasks[i].ref.data(), ref_len,
+                h_ref_all.data() + static_cast<std::size_t>(i) * ref_len);
+    std::copy_n(tasks[i].alt.data(), alt_len,
+                h_alt_all.data() + static_cast<std::size_t>(i) * alt_len);
+  }
+
+  std::vector<int> h_score_all(n * mat_size, 0);
+  std::vector<int> h_trace_all(n * mat_size, 0);
+
+  // device buffers
+  char* d_ref_all = nullptr;
+  char* d_alt_all = nullptr;
+  int*  d_score_all = nullptr;
+  int*  d_trace_all = nullptr;
+
+  int*  d_gap_size_down_all  = nullptr;
+  int*  d_best_gap_down_all  = nullptr;
+  int*  d_gap_size_right_all = nullptr;
+  int*  d_best_gap_right_all = nullptr;
+
+  const std::size_t ref_bytes = h_ref_all.size() * sizeof(char);
+  const std::size_t alt_bytes = h_alt_all.size() * sizeof(char);
+  const std::size_t mat_bytes = h_score_all.size() * sizeof(int);
+
+  check_cuda(cudaMalloc(&d_ref_all, ref_bytes), "cudaMalloc d_ref_all");
+  check_cuda(cudaMalloc(&d_alt_all, alt_bytes), "cudaMalloc d_alt_all");
+  check_cuda(cudaMalloc(&d_score_all, mat_bytes), "cudaMalloc d_score_all");
+  check_cuda(cudaMalloc(&d_trace_all, mat_bytes), "cudaMalloc d_trace_all");
+
+  // gap arrays：每個 alignment 各有 (cols+1) / (rows+1) 長度
+  check_cuda(cudaMalloc(&d_gap_size_down_all,
+                        static_cast<std::size_t>(n) * (cols + 1) * sizeof(int)),
+             "cudaMalloc gap_size_down_all");
+  check_cuda(cudaMalloc(&d_best_gap_down_all,
+                        static_cast<std::size_t>(n) * (cols + 1) * sizeof(int)),
+             "cudaMalloc best_gap_down_all");
+  check_cuda(cudaMalloc(&d_gap_size_right_all,
+                        static_cast<std::size_t>(n) * (rows + 1) * sizeof(int)),
+             "cudaMalloc gap_size_right_all");
+  check_cuda(cudaMalloc(&d_best_gap_right_all,
+                        static_cast<std::size_t>(n) * (rows + 1) * sizeof(int)),
+             "cudaMalloc best_gap_right_all");
+
+  check_cuda(cudaMemcpy(d_ref_all, h_ref_all.data(), ref_bytes,
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy ref_all");
+  check_cuda(cudaMemcpy(d_alt_all, h_alt_all.data(), alt_bytes,
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy alt_all");
+
+  // 一個 block 處理一個 alignment，目前每個 block 只用單一 thread
+  dim3 grid(n);
+  dim3 block(1);
+  smith_waterman_kernel<<<grid, block>>>(
+      d_ref_all, d_alt_all,
+      static_cast<int>(ref_len), static_cast<int>(alt_len),
+      params.w_match, params.w_mismatch,
+      params.w_open, params.w_extend,
+      d_score_all, d_trace_all,
+      d_gap_size_down_all, d_best_gap_down_all,
+      d_gap_size_right_all, d_best_gap_right_all,
+      n);
+
+  check_cuda(cudaGetLastError(), "kernel launch");
+  check_cuda(cudaDeviceSynchronize(), "kernel sync");
+
+  check_cuda(cudaMemcpy(h_score_all.data(), d_score_all, mat_bytes,
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy score_all back");
+  check_cuda(cudaMemcpy(h_trace_all.data(), d_trace_all, mat_bytes,
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy trace_all back");
+
+  cudaFree(d_ref_all);
+  cudaFree(d_alt_all);
+  cudaFree(d_score_all);
+  cudaFree(d_trace_all);
+  cudaFree(d_gap_size_down_all);
+  cudaFree(d_best_gap_down_all);
+  cudaFree(d_gap_size_right_all);
+  cudaFree(d_best_gap_right_all);
+
+  std::vector<std::pair<int, Cigar>> results;
+  results.reserve(n);
+
+  for (int i = 0; i < n; ++i) {
+    const int* score_ptr = h_score_all.data() + static_cast<std::size_t>(i) * mat_size;
+    const int* trace_ptr = h_trace_all.data() + static_cast<std::size_t>(i) * mat_size;
+
+    results.push_back(
+      traceback_and_build_cigar(score_ptr, trace_ptr,
+                                static_cast<int>(ref_len),
+                                static_cast<int>(alt_len)));
+  }
+
+  return results;
+}
+
+// ----------------- Single-pair interface -----------------
+
 auto SmithWatermanCuda::align(std::string_view ref, std::string_view alt,
                               Parameters params)
-  -> std::pair<int, Cigar> 
+  -> std::pair<int, Cigar>
 {
   assert(!ref.empty() && !alt.empty());
 
@@ -226,79 +375,12 @@ auto SmithWatermanCuda::align(std::string_view ref, std::string_view alt,
     return {0, Cigar(cigar_str)};
   }
 
-  const int ref_len = static_cast<int>(ref.size());
-  const int alt_len = static_cast<int>(alt.size());
-  const int rows = ref_len + 1;
-  const int cols = alt_len + 1;
-  const size_t mat_size = static_cast<size_t>(rows) * cols;
+  // 一般情況用 batched 實作處理（batch size = 1）
+  std::vector<TaskView> tasks;
+  tasks.push_back(TaskView{ref, alt});
 
-  // host buffer（flattened）
-  std::vector<int> h_score(mat_size, 0);
-  std::vector<int> h_trace(mat_size, 0);
-
-  // device buffer
-  char* d_ref = nullptr;
-  char* d_alt = nullptr;
-  int*  d_score = nullptr;
-  int*  d_trace = nullptr;
-
-  int*  d_gap_size_down  = nullptr;
-  int*  d_best_gap_down  = nullptr;
-  int*  d_gap_size_right = nullptr;
-  int*  d_best_gap_right = nullptr;
-
-  check_cuda(cudaMalloc(&d_ref, ref_len * sizeof(char)), "cudaMalloc d_ref");
-  check_cuda(cudaMalloc(&d_alt, alt_len * sizeof(char)), "cudaMalloc d_alt");
-  check_cuda(cudaMalloc(&d_score, mat_size * sizeof(int)), "cudaMalloc d_score");
-  check_cuda(cudaMalloc(&d_trace, mat_size * sizeof(int)), "cudaMalloc d_trace");
-
-  // gap arrays 長度：down 按 j (col)、right 按 i (row)
-  check_cuda(cudaMalloc(&d_gap_size_down,  (cols + 1) * sizeof(int)), "cudaMalloc gap_size_down");
-  check_cuda(cudaMalloc(&d_best_gap_down,  (cols + 1) * sizeof(int)), "cudaMalloc best_gap_down");
-  check_cuda(cudaMalloc(&d_gap_size_right, (rows + 1) * sizeof(int)), "cudaMalloc gap_size_right");
-  check_cuda(cudaMalloc(&d_best_gap_right, (rows + 1) * sizeof(int)), "cudaMalloc best_gap_right");
-
-  check_cuda(cudaMemcpy(d_ref, ref.data(), ref_len * sizeof(char),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy ref");
-  check_cuda(cudaMemcpy(d_alt, alt.data(), alt_len * sizeof(char),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy alt");
-
-  // 目前先啟一個 block、一個 thread
-  dim3 grid(1);
-  dim3 block(1);
-  smith_waterman_kernel<<<grid, block>>>(
-      d_ref, ref_len,
-      d_alt, alt_len,
-      params.w_match, params.w_mismatch,
-      params.w_open, params.w_extend,
-      d_score, d_trace,
-      d_gap_size_down, d_best_gap_down,
-      d_gap_size_right, d_best_gap_right);
-
-  check_cuda(cudaGetLastError(), "kernel launch");
-  check_cuda(cudaDeviceSynchronize(), "kernel sync");
-
-  check_cuda(cudaMemcpy(h_score.data(), d_score,
-                        mat_size * sizeof(int),
-                        cudaMemcpyDeviceToHost),
-             "cudaMemcpy score back");
-  check_cuda(cudaMemcpy(h_trace.data(), d_trace,
-                        mat_size * sizeof(int),
-                        cudaMemcpyDeviceToHost),
-             "cudaMemcpy trace back");
-
-  cudaFree(d_ref);
-  cudaFree(d_alt);
-  cudaFree(d_score);
-  cudaFree(d_trace);
-  cudaFree(d_gap_size_down);
-  cudaFree(d_best_gap_down);
-  cudaFree(d_gap_size_right);
-  cudaFree(d_best_gap_right);
-
-  return traceback_and_build_cigar(h_score, h_trace, ref_len, alt_len);
+  auto results = align_batch(tasks, params);
+  return results.front();
 }
 
 } // namespace biovoltron

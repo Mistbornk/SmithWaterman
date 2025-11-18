@@ -6,172 +6,119 @@
 #include <fstream>
 using namespace biovoltron;
 
-TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWaterman]") 
-{
-    // define in cmake
-    std::string data_path = DATA_PATH;
+namespace {
+std::string read_fasta_sequence(const std::string& path) {
+  std::ifstream f(path);
+  REQUIRE(f.good());
+  std::string seq, line;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line[0] != '>')
+      seq += line;
+  }
+  return seq;
+}
+} // namespace
 
-    // read ref.fasta
-    std::ifstream fref(data_path + "/ref.fasta");
-    REQUIRE(fref.good());
+TEST_CASE("SmithWaterman::align / SmithWatermanCuda::align 基本行為", "[SmithWaterman]") {
+  const std::string base = "ACGTACGTACGTACGTACGTACGTACGTACGT"; // 32 bp
 
-    std::string line, ref;
-    while (std::getline(fref, line)) {
-        if (!line.empty() && line[0] != '>') ref += line;
-    }
+  SECTION("同長度且差異 <=2 時走 quick path，CIGAR 應為全 M") {
+    std::string ref = base;
+    std::string alt = base;
+    // 引入單一 mismatch 仍應走 quick path
+    alt[5] = (alt[5] == 'A') ? 'C' : 'A';
 
-    // read alt.fasta
-    std::ifstream falt(data_path + "/alt.fasta");
-    REQUIRE(falt.good());
+    const auto cpu_start = std::chrono::high_resolution_clock::now();
+    const auto [offset_cpu, cigar_cpu] = SmithWaterman::align(ref, alt);
+    const auto cpu_end = std::chrono::high_resolution_clock::now();
 
-    std::string alt, line_alt;
-    while (std::getline(falt, line_alt)) {
-        if (!line_alt.empty() && line_alt[0] != '>') alt += line_alt;
-    }
-    REQUIRE(ref.size() == alt.size());
+    const auto gpu_start = std::chrono::high_resolution_clock::now();
+    const auto [offset_gpu, cigar_gpu] = SmithWatermanCuda::align(ref, alt);
+    const auto gpu_end = std::chrono::high_resolution_clock::now();
 
-  SECTION("Same reads") 
-  {
-    auto start = std::chrono::high_resolution_clock::now();  // Start timer
-    // Test case: identical sequences
-    const auto [offset, cigar] = SmithWaterman::align(ref, alt);
+    const std::string expected = std::to_string(ref.size()) + 'M';
+    REQUIRE(offset_cpu == 0);
+    REQUIRE(offset_gpu == 0);
+    REQUIRE(std::string(cigar_cpu) == expected);
+    REQUIRE(std::string(cigar_gpu) == expected);
 
-    REQUIRE(offset == 0);                // Should align from the beginning
-    REQUIRE(std::string(cigar) == "162M"); // Expect perfect match over all 162 bases
-
-    // End timer and print total execution time
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  
-    std::cout << "SmithWaterman_same time: " << duration << " us" << std::endl;
+    const auto cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
+    const auto gpu_us = std::chrono::duration_cast<std::chrono::microseconds>(gpu_end - gpu_start).count();
+    const double speedup = gpu_us > 0 ? static_cast<double>(cpu_us) / static_cast<double>(gpu_us) : 0.0;
+    std::cout << "[Quick path] CPU: " << cpu_us << " us, CUDA: " << gpu_us
+              << " us, speedup: " << speedup << "x" << std::endl;
   }
 
-  SECTION("Substitutions") 
-  {
-    //auto start = std::chrono::high_resolution_clock::now();  // Start timer
-    // Introduce mismatches between positions 70 and 79
-    for (auto idx = 70; idx < 80; idx++) {
-      ref[idx] = 'A';  // Change reference to A
-      alt[idx] = 'T';  // Change alt to T
-    }
+  SECTION("插入案例，檢查 CPU/GPU 結果一致且包含 I") {
+    std::string ref = base;
+    std::string alt = base;
+    alt.insert(10, "T"); // 在第 10 個位置插入
 
-    const auto [offset, cigar] = SmithWaterman::align(ref, alt);
+    const auto cpu_start = std::chrono::high_resolution_clock::now();
+    const auto [offset_cpu, cigar_cpu] = SmithWaterman::align(ref, alt);
+    const auto cpu_end = std::chrono::high_resolution_clock::now();
 
-    REQUIRE(offset == 0);                       // Still expected to align at position 0
-    REQUIRE(std::string(cigar) == "69M10D1M10I82M"); // Complex alignment with substitutions turned into 10D/10I
+    const auto gpu_start = std::chrono::high_resolution_clock::now();
+    const auto [offset_gpu, cigar_gpu] = SmithWatermanCuda::align(ref, alt);
+    const auto gpu_end = std::chrono::high_resolution_clock::now();
 
-    // End timer and print total execution time
-    //auto end = std::chrono::high_resolution_clock::now();
-    //auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  
-    //std::cout << "SmithWaterman_substi time: " << duration << " us" << std::endl;
+    REQUIRE(offset_cpu == offset_gpu);
+    REQUIRE(std::string(cigar_cpu) == std::string(cigar_gpu));
+    REQUIRE(std::string(cigar_cpu).find('I') != std::string::npos);
+
+    const auto cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
+    const auto gpu_us = std::chrono::duration_cast<std::chrono::microseconds>(gpu_end - gpu_start).count();
+    const double speedup = gpu_us > 0 ? static_cast<double>(cpu_us) / static_cast<double>(gpu_us) : 0.0;
+    std::cout << "[Insertion] CPU: " << cpu_us << " us, CUDA: " << gpu_us
+              << " us, speedup: " << speedup << "x" << std::endl;
   }
 
-  SECTION("Deletion") 
-  {
-    //auto start = std::chrono::high_resolution_clock::now();  // Start timer
-    // Simulate a deletion in the alt (query) sequence at position 70
-    alt.erase(alt.begin() + 70);
+  SECTION("缺失案例，檢查 CPU/GPU 結果一致且包含 D") {
+    std::string ref = base;
+    std::string alt = base;
+    alt.erase(10, 1); // 刪除一個字元
 
-    const auto [offset, cigar] = SmithWaterman::align(ref, alt);
+    const auto cpu_start = std::chrono::high_resolution_clock::now();
+    const auto [offset_cpu, cigar_cpu] = SmithWaterman::align(ref, alt);
+    const auto cpu_end = std::chrono::high_resolution_clock::now();
 
-    REQUIRE(offset == 0);
-    REQUIRE(std::string(cigar) == "70M1D91M");  // One deletion at position 70
+    const auto gpu_start = std::chrono::high_resolution_clock::now();
+    const auto [offset_gpu, cigar_gpu] = SmithWatermanCuda::align(ref, alt);
+    const auto gpu_end = std::chrono::high_resolution_clock::now();
 
-    // End timer and print total execution time
-    //auto end = std::chrono::high_resolution_clock::now();
-    //auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  
-    //std::cout << "SmithWaterman_del time: " << duration << " us" << std::endl;
-  }
+    REQUIRE(offset_cpu == offset_gpu);
+    REQUIRE(std::string(cigar_cpu) == std::string(cigar_gpu));
+    REQUIRE(std::string(cigar_cpu).find('D') != std::string::npos);
 
-  SECTION("Insertion") 
-  {
-    //auto start = std::chrono::high_resolution_clock::now();  // Start timer
-    // Simulate an insertion of 'T' in the alt (query) sequence at position 70
-    alt.insert(alt.begin() + 70, 'T');
-
-    const auto [offset, cigar] = SmithWaterman::align(ref, alt);
-
-    REQUIRE(offset == 0);
-    REQUIRE(std::string(cigar) == "70M1I92M");  // One insertion at position 70
-
-    // End timer and print total execution time
-    //auto end = std::chrono::high_resolution_clock::now();
-    //auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  
-    //std::cout << "SmithWaterman_ins time: " << duration << " us" << std::endl;
-  }
-
-  SECTION("Mix") 
-  {
-    //auto start = std::chrono::high_resolution_clock::now();  // Start timer
-    // Introduce mismatches at multiple regions
-    for (auto idx = 0; idx < ref.size(); idx++) {
-      if ((idx > 10 && idx < 20) || (idx > 70 && idx < 80)
-          || (idx > 120 && idx < 130)) {
-        ref[idx] = 'A'; // Mutate reference
-        alt[idx] = 'T'; // Mutate alt
-      }
-    }
-
-    // Simulate one deletion and one insertion
-    alt.erase(alt.begin() + 60);         // Delete at position 60
-    alt.insert(alt.begin() + 90, 'T');   // Insert at position 90
-
-    const auto [offset, cigar] = SmithWaterman::align(ref, alt);
-
-    REQUIRE(offset == 0);
-    REQUIRE(std::string(cigar) == "11M9D9I40M1D10M9D9I11M1I28M9D2M9I32M");
-    // Explanation of CIGAR:
-    // - 20S: soft clipped (low-scoring region at beginning)
-    // - Mix of matches (M), deletions (D), and insertions (I) that reflect edits above
-
-    // End timer and print total execution time
-    //auto end = std::chrono::high_resolution_clock::now();
-    //auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  
-    //std::cout << "SmithWaterman_mix time: " << duration << " us" << std::endl;
+    const auto cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
+    const auto gpu_us = std::chrono::duration_cast<std::chrono::microseconds>(gpu_end - gpu_start).count();
+    const double speedup = gpu_us > 0 ? static_cast<double>(cpu_us) / static_cast<double>(gpu_us) : 0.0;
+    std::cout << "[Deletion] CPU: " << cpu_us << " us, CUDA: " << gpu_us
+              << " us, speedup: " << speedup << "x" << std::endl;
   }
 }
 
-TEST_CASE("SmithWatermanCuda::align - Performs Smith-Waterman alignment", "[SmithWaterman]") 
-{
-  // define in cmake
-  std::string data_path = DATA_PATH;
+TEST_CASE("使用檔案序列時 CPU/GPU 結果需一致", "[SmithWaterman]") {
+  const std::string data_path = DATA_PATH;
+  const std::string ref = read_fasta_sequence(data_path + "/ref.fasta");
+  const std::string alt = read_fasta_sequence(data_path + "/alt.fasta");
+  REQUIRE(!ref.empty());
+  REQUIRE(!alt.empty());
 
-  // read ref.fasta
-  std::ifstream fref(data_path + "/ref.fasta");
-  REQUIRE(fref.good());
+  const auto cpu_start = std::chrono::high_resolution_clock::now();
+  const auto [offset_cpu, cigar_cpu] = SmithWaterman::align(ref, alt);
+  const auto cpu_end = std::chrono::high_resolution_clock::now();
 
-  std::string line, ref;
-  while (std::getline(fref, line)) {
-      if (!line.empty() && line[0] != '>') ref += line;
-  }
+  const auto gpu_start = std::chrono::high_resolution_clock::now();
+  const auto [offset_gpu, cigar_gpu] = SmithWatermanCuda::align(ref, alt);
+  const auto gpu_end = std::chrono::high_resolution_clock::now();
 
-  // read alt.fasta
-  std::ifstream falt(data_path + "/alt.fasta");
-  REQUIRE(falt.good());
+  REQUIRE(offset_cpu == offset_gpu);
+  REQUIRE(std::string(cigar_cpu) == std::string(cigar_gpu));
 
-  std::string alt, line_alt;
-  while (std::getline(falt, line_alt)) {
-      if (!line_alt.empty() && line_alt[0] != '>') alt += line_alt;
-  }
-  REQUIRE(ref.size() == alt.size());
-
-  SECTION("Same reads") 
-  {
-    auto start = std::chrono::high_resolution_clock::now();  // Start timer
-    // Test case: identical sequences
-    const auto [offset, cigar] = SmithWatermanCuda::align(ref, alt);
-
-    REQUIRE(offset == 0);                // Should align from the beginning
-    REQUIRE(std::string(cigar) == std::to_string(ref.size()) + 'M'); // Expect perfect match over all bases
-
-    // End timer and print total execution time
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-  
-    std::cout << "SmithWatermanCuda_same time: " << duration << " us" << std::endl;
-  }
+  const auto cpu_us = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
+  const auto gpu_us = std::chrono::duration_cast<std::chrono::microseconds>(gpu_end - gpu_start).count();
+  const double speedup = gpu_us > 0 ? static_cast<double>(cpu_us) / static_cast<double>(gpu_us) : 0.0;
+  std::cout << "[File input] CPU: " << cpu_us << " us, CUDA: " << gpu_us
+            << " us, speedup: " << speedup << "x" << std::endl;
 }

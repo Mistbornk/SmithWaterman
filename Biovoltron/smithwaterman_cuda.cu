@@ -7,6 +7,7 @@
 #include <limits>
 #include <algorithm>
 #include <climits>
+#include <memory>
 
 namespace biovoltron {
 
@@ -17,25 +18,57 @@ static inline void check_cuda(cudaError_t err, const char* msg) {
   }
 }
 
+struct CudaDeleter {
+  void operator()(void* ptr) const noexcept {
+    if (ptr) cudaFree(ptr);
+  }
+};
+
+struct CudaHostDeleter {
+  void operator()(void* ptr) const noexcept {
+    if (ptr) cudaFreeHost(ptr);
+  }
+};
+
+template <typename T>
+using cuda_unique_ptr = std::unique_ptr<T, CudaDeleter>;
+
+template <typename T>
+using cuda_host_unique_ptr = std::unique_ptr<T, CudaHostDeleter>;
+
+template <typename T>
+static cuda_unique_ptr<T> make_device_buffer(std::size_t count, const char* msg) {
+  T* ptr = nullptr;
+  check_cuda(cudaMalloc(&ptr, count * sizeof(T)), msg);
+  return cuda_unique_ptr<T>(ptr);
+}
+
+template <typename T>
+static cuda_host_unique_ptr<T> make_pinned_buffer(std::size_t count, const char* msg) {
+  T* ptr = nullptr;
+  check_cuda(cudaMallocHost(reinterpret_cast<void**>(&ptr), count * sizeof(T)), msg);
+  return cuda_host_unique_ptr<T>(ptr);
+}
+
 // --- CUDA kernel ---
 // Batched 版：一個 block 負責一個 alignment，
 // 目前仍由 thread 0 在 block 裡跑 DP + traceback（之後可以再做 finer-grained 平行化）
-__global__ void smith_waterman_kernel(const char* all_refs,
-                                      const char* all_alts,
+__global__ void smith_waterman_kernel(const char* __restrict__ all_refs,
+                                      const char* __restrict__ all_alts,
                                       int ref_len, int alt_len,
                                       int w_match, int w_mismatch,
                                       int w_open, int w_extend,
-                                      int* all_scores, int* all_traces,
-                                      int* all_gap_size_down,
-                                      int* all_best_gap_down,
-                                      int* all_gap_size_right,
-                                      int* all_best_gap_right,
+                                      int* __restrict__ all_scores, int* __restrict__ all_traces,
+                                      int* __restrict__ all_gap_size_down,
+                                      int* __restrict__ all_best_gap_down,
+                                      int* __restrict__ all_gap_size_right,
+                                      int* __restrict__ all_best_gap_right,
                                       // CIGAR 輸出相關
-                                      unsigned* all_cigar_lens,
-                                      char*     all_cigar_ops,
-                                      int*      cigar_start,
-                                      int*      cigar_count,
-                                      int*      align_offsets,
+                                      unsigned* __restrict__ all_cigar_lens,
+                                      char*     __restrict__ all_cigar_ops,
+                                      int*      __restrict__ cigar_start,
+                                      int*      __restrict__ cigar_count,
+                                      int*      __restrict__ align_offsets,
                                       int       max_cigar_ops,
                                       int       n_alignments)
 {
@@ -68,14 +101,6 @@ __global__ void smith_waterman_kernel(const char* all_refs,
   auto idx = [cols](int i, int j) {
     return i * cols + j;
   };
-
-  // 初始化 score / trace
-  for (int i = 0; i < rows; ++i) {
-    for (int j = 0; j < cols; ++j) {
-      score[idx(i, j)] = 0;
-      trace[idx(i, j)] = 0;
-    }
-  }
 
   // gap tracking arrays（和 CPU 版相同邏輯），由 host 預先配置，只在這裡初始化
   const int NEG_INF = INT_MIN / 2;
@@ -283,36 +308,21 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
   // （全 I + 全 D + 兩個 S 等極端情形）
   const int max_cigar_ops = static_cast<int>(ref_len + alt_len + 2);
 
-  // host flattened buffers
-  std::vector<char> h_ref_all(n * ref_len);
-  std::vector<char> h_alt_all(n * alt_len);
+  // host flattened buffers（pinned，較快的 H2D 拷貝）
+  auto h_ref_all = make_pinned_buffer<char>(static_cast<std::size_t>(n) * ref_len,
+                                            "cudaMallocHost h_ref_all");
+  auto h_alt_all = make_pinned_buffer<char>(static_cast<std::size_t>(n) * alt_len,
+                                            "cudaMallocHost h_alt_all");
 
   for (int i = 0; i < n; ++i) {
     std::copy_n(tasks[i].ref.data(), ref_len,
-                h_ref_all.data() + static_cast<std::size_t>(i) * ref_len);
+                h_ref_all.get() + static_cast<std::size_t>(i) * ref_len);
     std::copy_n(tasks[i].alt.data(), alt_len,
-                h_alt_all.data() + static_cast<std::size_t>(i) * alt_len);
+                h_alt_all.get() + static_cast<std::size_t>(i) * alt_len);
   }
 
-  // device buffers
-  char* d_ref_all = nullptr;
-  char* d_alt_all = nullptr;
-  int*  d_score_all = nullptr;
-  int*  d_trace_all = nullptr;
-
-  int*  d_gap_size_down_all  = nullptr;
-  int*  d_best_gap_down_all  = nullptr;
-  int*  d_gap_size_right_all = nullptr;
-  int*  d_best_gap_right_all = nullptr;
-
-  unsigned* d_cigar_lens = nullptr;
-  char*     d_cigar_ops  = nullptr;
-  int*      d_cigar_start = nullptr;
-  int*      d_cigar_count = nullptr;
-  int*      d_align_offsets = nullptr;
-
-  const std::size_t ref_bytes = h_ref_all.size() * sizeof(char);
-  const std::size_t alt_bytes = h_alt_all.size() * sizeof(char);
+  const std::size_t ref_bytes = static_cast<std::size_t>(n) * ref_len * sizeof(char);
+  const std::size_t alt_bytes = static_cast<std::size_t>(n) * alt_len * sizeof(char);
 
   // score/trace matrix（只在 device 使用，不會拷回 host）
   const std::size_t mat_bytes_all = static_cast<std::size_t>(n) * mat_size * sizeof(int);
@@ -322,53 +332,60 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
   const std::size_t cigar_lens_bytes = cigar_total_ops * sizeof(unsigned);
   const std::size_t cigar_ops_bytes  = cigar_total_ops * sizeof(char);
 
-  check_cuda(cudaMalloc(&d_ref_all, ref_bytes), "cudaMalloc d_ref_all");
-  check_cuda(cudaMalloc(&d_alt_all, alt_bytes), "cudaMalloc d_alt_all");
-  check_cuda(cudaMalloc(&d_score_all, mat_bytes_all), "cudaMalloc d_score_all");
-  check_cuda(cudaMalloc(&d_trace_all, mat_bytes_all), "cudaMalloc d_trace_all");
+  // device buffers
+  auto d_ref_all           = make_device_buffer<char>(static_cast<std::size_t>(n) * ref_len,
+                                                      "cudaMalloc d_ref_all");
+  auto d_alt_all           = make_device_buffer<char>(static_cast<std::size_t>(n) * alt_len,
+                                                      "cudaMalloc d_alt_all");
+  auto d_score_all         = make_device_buffer<int>(static_cast<std::size_t>(n) * mat_size,
+                                                     "cudaMalloc d_score_all");
+  auto d_trace_all         = make_device_buffer<int>(static_cast<std::size_t>(n) * mat_size,
+                                                     "cudaMalloc d_trace_all");
+  auto d_gap_size_down_all = make_device_buffer<int>(static_cast<std::size_t>(n) * (cols + 1),
+                                                     "cudaMalloc gap_size_down_all");
+  auto d_best_gap_down_all = make_device_buffer<int>(static_cast<std::size_t>(n) * (cols + 1),
+                                                     "cudaMalloc best_gap_down_all");
+  auto d_gap_size_right_all= make_device_buffer<int>(static_cast<std::size_t>(n) * (rows + 1),
+                                                     "cudaMalloc gap_size_right_all");
+  auto d_best_gap_right_all= make_device_buffer<int>(static_cast<std::size_t>(n) * (rows + 1),
+                                                     "cudaMalloc best_gap_right_all");
+  auto d_cigar_lens        = make_device_buffer<unsigned>(cigar_total_ops, "cudaMalloc d_cigar_lens");
+  auto d_cigar_ops         = make_device_buffer<char>(cigar_total_ops, "cudaMalloc d_cigar_ops");
+  auto d_cigar_start       = make_device_buffer<int>(n, "cudaMalloc d_cigar_start");
+  auto d_cigar_count       = make_device_buffer<int>(n, "cudaMalloc d_cigar_count");
+  auto d_align_offsets     = make_device_buffer<int>(n, "cudaMalloc d_align_offsets");
 
-  // gap arrays：每個 alignment 各有 (cols+1) / (rows+1) 長度
-  check_cuda(cudaMalloc(&d_gap_size_down_all,
-                        static_cast<std::size_t>(n) * (cols + 1) * sizeof(int)),
-             "cudaMalloc gap_size_down_all");
-  check_cuda(cudaMalloc(&d_best_gap_down_all,
-                        static_cast<std::size_t>(n) * (cols + 1) * sizeof(int)),
-             "cudaMalloc best_gap_down_all");
-  check_cuda(cudaMalloc(&d_gap_size_right_all,
-                        static_cast<std::size_t>(n) * (rows + 1) * sizeof(int)),
-             "cudaMalloc gap_size_right_all");
-  check_cuda(cudaMalloc(&d_best_gap_right_all,
-                        static_cast<std::size_t>(n) * (rows + 1) * sizeof(int)),
-             "cudaMalloc best_gap_right_all");
-
-  // CIGAR device buffer
-  check_cuda(cudaMalloc(&d_cigar_lens, cigar_lens_bytes), "cudaMalloc d_cigar_lens");
-  check_cuda(cudaMalloc(&d_cigar_ops,  cigar_ops_bytes),  "cudaMalloc d_cigar_ops");
-  check_cuda(cudaMalloc(&d_cigar_start, n * sizeof(int)), "cudaMalloc d_cigar_start");
-  check_cuda(cudaMalloc(&d_cigar_count, n * sizeof(int)), "cudaMalloc d_cigar_count");
-  check_cuda(cudaMalloc(&d_align_offsets, n * sizeof(int)), "cudaMalloc d_align_offsets");
-
-  check_cuda(cudaMemcpy(d_ref_all, h_ref_all.data(), ref_bytes,
+  check_cuda(cudaMemcpy(d_ref_all.get(), h_ref_all.get(), ref_bytes,
                         cudaMemcpyHostToDevice),
              "cudaMemcpy ref_all");
-  check_cuda(cudaMemcpy(d_alt_all, h_alt_all.data(), alt_bytes,
+  check_cuda(cudaMemcpy(d_alt_all.get(), h_alt_all.get(), alt_bytes,
                         cudaMemcpyHostToDevice),
              "cudaMemcpy alt_all");
+
+  // score/trace and gap-size arrays are zeroed up-front to avoid single-thread clearing inside the kernel
+  check_cuda(cudaMemset(d_score_all.get(), 0, mat_bytes_all), "cudaMemset score_all");
+  check_cuda(cudaMemset(d_trace_all.get(), 0, mat_bytes_all), "cudaMemset trace_all");
+  check_cuda(cudaMemset(d_gap_size_down_all.get(), 0,
+                        static_cast<std::size_t>(n) * (cols + 1) * sizeof(int)),
+             "cudaMemset gap_size_down_all");
+  check_cuda(cudaMemset(d_gap_size_right_all.get(), 0,
+                        static_cast<std::size_t>(n) * (rows + 1) * sizeof(int)),
+             "cudaMemset gap_size_right_all");
 
   // 一個 block 處理一個 alignment，目前每個 block 只用單一 thread
   dim3 grid(n);
   dim3 block(1);
   smith_waterman_kernel<<<grid, block>>>(
-      d_ref_all, d_alt_all,
+      d_ref_all.get(), d_alt_all.get(),
       static_cast<int>(ref_len), static_cast<int>(alt_len),
       params.w_match, params.w_mismatch,
       params.w_open, params.w_extend,
-      d_score_all, d_trace_all,
-      d_gap_size_down_all, d_best_gap_down_all,
-      d_gap_size_right_all, d_best_gap_right_all,
-      d_cigar_lens, d_cigar_ops,
-      d_cigar_start, d_cigar_count,
-      d_align_offsets,
+      d_score_all.get(), d_trace_all.get(),
+      d_gap_size_down_all.get(), d_best_gap_down_all.get(),
+      d_gap_size_right_all.get(), d_best_gap_right_all.get(),
+      d_cigar_lens.get(), d_cigar_ops.get(),
+      d_cigar_start.get(), d_cigar_count.get(),
+      d_align_offsets.get(),
       max_cigar_ops,
       n);
 
@@ -376,42 +393,27 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
   check_cuda(cudaDeviceSynchronize(), "kernel sync");
 
   // 將 CIGAR 結果帶回 host（比整個 score/trace matrix 小很多）
-  std::vector<unsigned> h_cigar_lens(cigar_total_ops);
-  std::vector<char>     h_cigar_ops(cigar_total_ops);
-  std::vector<int>      h_cigar_start(n);
-  std::vector<int>      h_cigar_count(n);
-  std::vector<int>      h_align_offsets(n);
+  auto h_cigar_lens    = make_pinned_buffer<unsigned>(cigar_total_ops, "cudaMallocHost cigar_lens");
+  auto h_cigar_ops     = make_pinned_buffer<char>(cigar_total_ops, "cudaMallocHost cigar_ops");
+  auto h_cigar_start   = make_pinned_buffer<int>(n, "cudaMallocHost cigar_start");
+  auto h_cigar_count   = make_pinned_buffer<int>(n, "cudaMallocHost cigar_count");
+  auto h_align_offsets = make_pinned_buffer<int>(n, "cudaMallocHost align_offsets");
 
-  check_cuda(cudaMemcpy(h_cigar_lens.data(), d_cigar_lens, cigar_lens_bytes,
+  check_cuda(cudaMemcpy(h_cigar_lens.get(), d_cigar_lens.get(), cigar_lens_bytes,
                         cudaMemcpyDeviceToHost),
              "cudaMemcpy cigar_lens");
-  check_cuda(cudaMemcpy(h_cigar_ops.data(), d_cigar_ops, cigar_ops_bytes,
+  check_cuda(cudaMemcpy(h_cigar_ops.get(), d_cigar_ops.get(), cigar_ops_bytes,
                         cudaMemcpyDeviceToHost),
              "cudaMemcpy cigar_ops");
-  check_cuda(cudaMemcpy(h_cigar_start.data(), d_cigar_start, n * sizeof(int),
+  check_cuda(cudaMemcpy(h_cigar_start.get(), d_cigar_start.get(), n * sizeof(int),
                         cudaMemcpyDeviceToHost),
              "cudaMemcpy cigar_start");
-  check_cuda(cudaMemcpy(h_cigar_count.data(), d_cigar_count, n * sizeof(int),
+  check_cuda(cudaMemcpy(h_cigar_count.get(), d_cigar_count.get(), n * sizeof(int),
                         cudaMemcpyDeviceToHost),
              "cudaMemcpy cigar_count");
-  check_cuda(cudaMemcpy(h_align_offsets.data(), d_align_offsets, n * sizeof(int),
+  check_cuda(cudaMemcpy(h_align_offsets.get(), d_align_offsets.get(), n * sizeof(int),
                         cudaMemcpyDeviceToHost),
              "cudaMemcpy align_offsets");
-
-  // 釋放 device memory
-  cudaFree(d_ref_all);
-  cudaFree(d_alt_all);
-  cudaFree(d_score_all);
-  cudaFree(d_trace_all);
-  cudaFree(d_gap_size_down_all);
-  cudaFree(d_best_gap_down_all);
-  cudaFree(d_gap_size_right_all);
-  cudaFree(d_best_gap_right_all);
-  cudaFree(d_cigar_lens);
-  cudaFree(d_cigar_ops);
-  cudaFree(d_cigar_start);
-  cudaFree(d_cigar_count);
-  cudaFree(d_align_offsets);
 
   // 在 host 上組回 Cigar 物件
   std::vector<std::pair<int, Cigar>> results;
@@ -419,18 +421,18 @@ auto SmithWatermanCuda::align_batch(const std::vector<TaskView>& tasks,
 
   for (int aln = 0; aln < n; ++aln) {
     const int base = aln * max_cigar_ops;
-    const int start = h_cigar_start[aln];
-    const int cnt   = h_cigar_count[aln];
+    const int start = h_cigar_start.get()[aln];
+    const int cnt   = h_cigar_count.get()[aln];
 
     Cigar cigar{};
     for (int k = 0; k < cnt; ++k) {
       const int idx = start + k;
-      const unsigned len = h_cigar_lens[base + idx];
-      const char op      = h_cigar_ops[base + idx];
+      const unsigned len = h_cigar_lens.get()[base + idx];
+      const char op      = h_cigar_ops.get()[base + idx];
       cigar.emplace_back(len, op);
     }
 
-    results.emplace_back(h_align_offsets[aln], std::move(cigar));
+    results.emplace_back(h_align_offsets.get()[aln], std::move(cigar));
   }
 
   return results;

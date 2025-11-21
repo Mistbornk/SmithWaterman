@@ -378,7 +378,6 @@ SmithWatermanCuda::SWResult cpu_traceback_int8(int N, int M, int2 sink, const st
     if (i > 0) cigar.emplace_back(i, 'S');
     cigar.reverse();
     
-    // [修正] 回傳 j 作為 Offset (Start Position)，而不是 sink.x (End Position)
     return {j, cigar, best_score};
 }
 

@@ -67,6 +67,13 @@ struct SmithWatermanCuda {
         Parameters params = NEW_SW_PARAMETERS)
     -> SWResult; 
   
+  static auto
+  batch_align(
+        const std::vector<std::string>& refs,
+        const std::vector<std::string>& alts,
+        Parameters params = NEW_SW_PARAMETERS)
+    -> std::vector<SmithWatermanCuda::SWResult>;
+  
 };
 
 } // namespace biovoltron

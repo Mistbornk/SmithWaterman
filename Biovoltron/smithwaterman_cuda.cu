@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <iostream>
 
 #define CUDACHECKASYNC \
 { cudaError_t err = cudaPeekAtLastError(); \
@@ -59,10 +60,6 @@ __device__ __forceinline__ int dmin3(int a, int b, int c)
     return dmin(a, dmin(b, c));
 }
 
-// -------------------------------------------------------------------------------------------------
-// Result of one alignment inside the warp
-// (score + sink position). Minimal版，類似 nvbio::alignment_result<>.
-// -------------------------------------------------------------------------------------------------
 struct AlignmentResult
 {
     int   score;
@@ -76,15 +73,6 @@ struct AlignmentResult
     AlignmentResult(int s, int jj, int ii) : score(s), j(jj), i(ii) {}
 };
 
-// -------------------------------------------------------------------------------------------------
-// Warp-parallel Smith-Waterman scoring kernel (no traceback).
-// 參考 nvbio/alignment/sw/sw_warp_inl.h 的寫法但簡化為：
-//   * 只做 LOCAL alignment
-//   * 線性 gap penalty（之後可以改 affine 狀態機）
-//   * 一個 warp 處理一個 alignment
-// ref : 垂直 (長度 N)
-// alt : 水平 (長度 M)
-// -------------------------------------------------------------------------------------------------
 __global__
 void sw_warp_kernel(const char* __restrict__ ref,
                     const char* __restrict__ alt,
@@ -95,37 +83,59 @@ void sw_warp_kernel(const char* __restrict__ ref,
                     int gap_open,        // vertical gaps
                     int gap_extend,       // horizontal gaps
                     int* __restrict__ best_score_out,
-                    int2* __restrict__ sink_out)
+                    int2* __restrict__ sink_out,
+                    int* __restrict__ global_temp_h,
+                    int* __restrict__ global_temp_f,
+                    int* __restrict__ global_temp_len_f,
+                    int8_t* __restrict__ trace)
 {
+    // -infinite
+    const int NEG_INF = INT_MIN / 2;
+    // thread id (1-indexed)
     const unsigned int lane = warp_tid();
-	const int NEG_INF = INT_MIN / 2;
 
-    // 動態 shared memory: column[0..N]
-    extern __shared__ int temp[];
+    extern __shared__ int smem[];
+    int* temp_h;
+    int* temp_f;
+    int* temp_len_f;
 
-    for (int j = lane; j <= N; j += WARP_SIZE)
-        temp[j] = 0;
+    if (global_temp_h == nullptr) {
+        temp_h = smem;
+        temp_f = smem + (N + 1);
+        temp_len_f = smem + 2 * (N + 1);
+    } else {
+        temp_h = global_temp_h;
+        temp_f = global_temp_f;
+        temp_len_f = global_temp_len_f;
+    }
+
+    for (int j = lane; j <= N; j += WARP_SIZE) {
+        temp_h[j]     = 0; 
+        temp_f[j]     = NEG_INF; 
+        temp_len_f[j] = 0;
+    }
 
     __syncthreads();
 
-    int h_top  = 0;  // H(i-1,j)
-    int h_left = 0;  // H(i,j-1)
-    int h_diag = 0;  // H(i-1,j-1)
-    int h_val  = 0;
+    // H(i-1,j), H(i,j-1), H(i-1,j-1), current score
+    int h_top  = 0, h_left = 0, h_diag = 0, h_val  = 0;  
+    // E(i-1,j), E(i,j)
+    int e_top  = NEG_INF, e_val = NEG_INF;
+    // F(i,j-1), F(i,j)
+    int f_left = NEG_INF, f_val = NEG_INF;  
 
-    int e_top  = 0;  // E(i-1,j)
-    int e_val  = 0;  // E(i,j)
-
-    int f_left = 0;  // F(i,j-1)
-    int f_val  = 0;  // F(i,j)
+    int len_e_top = 0, len_e_val = 0;
+    int len_f_left = 0, len_f_val = 0;
 
     AlignmentResult best;
 
-    unsigned char r_j = 0;
-    int           temp_cache      = 0;
+    unsigned char r_j             = 0;
+    int temp_h_cache              = 0;
+    int temp_f_cache              = 0;
+    int temp_len_f_cache          = 0;
     unsigned char reference_cache = 0;
 
-    const unsigned int wi = lane + 1; // DP 中當前 warp stripe 的 column index (1..WARP_SIZE)
+    const unsigned int wi = lane + 1; // current warp stripe's column index (1..WARP_SIZE)
 
     // warp block
     /*
@@ -141,19 +151,19 @@ void sw_warp_kernel(const char* __restrict__ ref,
     */
     // wi is local thread offset
     /*
-        <------------ Stripe 1 (Width 32) ------------>
-        Col 1        Col 2        Col 3     ...  Col 32
-        +---+---+---+---+---+---+---+---+---+---+---+
-    j=1 |   |   |   |   |   |   |   |   |   |   |   |
-        +---+---+---+---+---+---+---+---+---+---+---+
-    j=2 |   |   |   |   |   |   |   |   |   |   |   |
-        +---+---+---+---+---+---+---+---+---+---+---+
-        ...
-        +---+---+---+---+---+---+---+---+---+---+---+
-        ^           ^   ^                                   ^
-        |           |   |                                   |
-Thread  1           2   3       ...                 Thread 32
-(wi =   1           2   3       ...                     wi=32)
+                <----------------- Stripe 1 (Width 32) ----------------->
+                    Col 1            Col 2        Col 3    ...   Col 32
+                +---------------+-----------+-------------+---+---------+
+            j=1 |               |           |             |...|         |
+                +---------------+-----------+-------------+---+---------+
+            j=2 |               |           |             |...|         |
+                +---------------+-----------+-------------+---+---------+
+                ...             |           |             |...|         |
+                +---------------+-----------+-------------+---+---------+
+                ^               ^               ^                       ^
+                |               |               |                       |
+        Thread  1               2               3       ...         Thread 32
+        (wi =   1               2               3       ...          wi=32)
     */
     // Through query (alt) do  WARP_SIZE stripe
     for (int warp_block = 0; warp_block < M; warp_block += WARP_SIZE)
@@ -165,15 +175,16 @@ Thread  1           2   3       ...                 Thread 32
 
         h_top  = 0;         // H(0, j)
         h_diag = 0;         // H(0, j-1)
-        e_top  = 0;         // E(0, j) 
-        f_left = 0;         // F(i, 0)
+        e_top  = NEG_INF;   // E(0, j) 
+        f_left = NEG_INF;   // F(i, 0)
+        len_e_top = 0; len_f_left = 0;
 
         // The alt char for this thread
         const unsigned char s_i = (i <= (unsigned)M) ? static_cast<unsigned char>(alt[i - 1]) : 0;
 
         // For the stripe's anti-diagonals
         /*
-        block_diag = 34 (example):
+        block_diag = 2 (example):
 
          i = 1   2   3...31  32
              +---+---+...+---+---+....
@@ -192,52 +203,100 @@ Thread  1           2   3       ...                 Thread 32
         {
             // Every WARP_SIZE anti-diagonals reload cache
             const unsigned int cache_row = (block_diag - 2) + lane;
-            temp_cache      = (cache_row < (unsigned)N) ? temp[cache_row]          					 : 0; // left value
-            reference_cache = (cache_row < (unsigned)N) ? static_cast<unsigned char>(ref[cache_row]) : 0; // ref char
+            if (cache_row < static_cast<unsigned>(N)) {
+                temp_h_cache     = temp_h[cache_row];
+                temp_f_cache     = temp_f[cache_row];
+                temp_len_f_cache = temp_len_f[cache_row];
+                reference_cache  = static_cast<unsigned char>(ref[cache_row]);
+            } else {
+                temp_h_cache     = 0;
+                temp_f_cache     = NEG_INF; 
+                temp_len_f_cache = 0;
+                reference_cache  = 0;
+            }
 
             for (unsigned int diag = block_diag; diag < block_diag + WARP_SIZE; ++diag)
             {
-                const unsigned int diag_len = dmin3(diag - 1, (unsigned)WARP_SIZE, warp_block_width);
+                const unsigned int diag_len = dmin3(diag - 1, static_cast<unsigned>(WARP_SIZE), warp_block_width);
                 const unsigned int j = diag - wi; // row index (1..N)
 
-                if (wi <= diag_len && j <= (unsigned)N)
+                if (wi <= diag_len && j <= static_cast<unsigned>(N))
                 {
                     if (wi == 1)
                     {
                         // thread 1 read reference char and left cell value
                         // and for lane 0 (first warp) will read new reference char in his row and left value=0
-                        r_j   = reference_cache;
-                        h_left = temp_cache;
+                        r_j        = reference_cache;
+                        h_left     = temp_h_cache;
+                        f_left     = temp_f_cache;
+                        len_f_left = temp_len_f_cache;
                     }
+
                     // if ref[j] == alt[i]
                     const int S_ij = (r_j == s_i) ? match_score : mismatch_score;
-					// --- affine E vertical gaps ---
-                    e_val = dmax(h_top + gap_open, e_top + gap_extend);
-                    // --- affine F horizontal gaps ---
-                    f_val = dmax(h_left + gap_open, f_left + gap_extend);
+                    int score_diag = h_diag + S_ij;
+                    
+                    // E (Vertical)
+                    int e_open = h_top + gap_open; int e_extend = e_top + gap_extend;
+                    if (e_open > e_extend) { e_val = e_open; len_e_val = 1; } 
+                    else { e_val = e_extend; len_e_val = len_e_top + 1; }
 
-                    // compute H(i,j)
-					h_val = h_diag + S_ij;
-					h_val = dmax3(h_val, e_val, f_val);
+                    // F (Horizontal)
+                    int f_open = h_left + gap_open; int f_extend = f_left + gap_extend;
+                    if (f_open > f_extend) { f_val = f_open; len_f_val = 1; } 
+                    else { f_val = f_extend; len_f_val = len_f_left + 1; }
+                    
+                    h_val = dmax3(score_diag, e_val, f_val);
 
-                    if (wi == WARP_SIZE)
-                        temp[j - 1] = h_val;
+                    // Traceback Logic (int8_t Length)
+                    // Diag > Left (Insertion) > Up (Deletion)
+                    int8_t trace_val = 0;
+                    if (h_val == score_diag) {
+                        trace_val = 0;
+                    } else if (h_val == f_val) {
+                        int l = (len_f_val > 127) ? 127 : len_f_val;
+                        trace_val = (int8_t)(-l); // Negative for Left/Insertion
+                    } else {
+                        int l = (len_e_val > 127) ? 127 : len_e_val;
+                        trace_val = (int8_t)(l);  // Positive for Up/Deletion
+                    }
+
+                    trace[size_t(j) * (M + 1) + i] = trace_val;
+
+                    if (wi == WARP_SIZE) {
+                        temp_h[j - 1] = h_val;
+                        temp_f[j - 1] = f_val;
+                        temp_len_f[j - 1] = len_f_val;
+                    }
 					
-					if (h_val >= best.score)
-						best = AlignmentResult(h_val, j, i);
+                    bool is_last_col = (i == static_cast<unsigned>(M));
+                    bool is_last_row = (j == static_cast<unsigned>(N));
+
+                    if (is_last_col || is_last_row)
+                    {
+                        if (h_val > best.score) {
+                            best = AlignmentResult(h_val, j, i);
+                        }
+                    }
 
                     h_diag = h_left;
                     h_top  = h_val;
                     e_top  = e_val;
                     f_left = f_val;
+                    len_e_top = len_e_val;
                 }
 
                 // warp shift
                 r_j           = shfl_up(r_j, 1);
                 h_left        = shfl_up(h_val, 1);
                 f_left        = shfl_up(f_val, 1);
-                temp_cache      = shfl_down(temp_cache, 1);
+                len_f_left = shfl_up(len_f_val, 1);
+
+                temp_h_cache    = shfl_down(temp_h_cache, 1);
+                temp_f_cache    = shfl_down(temp_f_cache, 1);
+                temp_len_f_cache = shfl_down(temp_len_f_cache, 1);
                 reference_cache = shfl_down(reference_cache, 1);
+
             }
         }
     }
@@ -253,7 +312,7 @@ Thread  1           2   3       ...                 Thread 32
         int other_j     = __shfl_down_sync(0xffffffffu, best_j,     offset);
         int other_i     = __shfl_down_sync(0xffffffffu, best_i,     offset);
 
-        if (other_score > best_score)
+        if (other_score > best_score || (other_score == best_score && other_score > INT_MIN/2))
         {
             best_score = other_score;
             best_j     = other_j;
@@ -276,6 +335,52 @@ namespace biovoltron {
 // -------------------------------------------------------------------------------------------------
 // Public API
 // -------------------------------------------------------------------------------------------------
+SmithWatermanCuda::SWResult cpu_traceback_int8(int N, int M, int2 sink, const std::vector<int8_t>& trace, int best_score) {
+    Cigar cigar;
+    int i = sink.y; 
+    int j = sink.x; 
+    
+    if (i < M) cigar.emplace_back(M - i, 'S');
+
+    char state = 'M'; 
+    int segment_len = 0;
+
+    while (i > 0 && j > 0) {
+        int8_t dir = trace[size_t(j) * (M + 1) + i];
+        
+        char new_state;
+        int step_size;
+
+        if (dir == 0) {
+            new_state = 'M'; step_size = 1;
+        } else if (dir > 0) { 
+            new_state = 'D'; step_size = dir;
+        } else { 
+            new_state = 'I'; step_size = -dir;
+        }
+
+        if (new_state == 'M') { i--; j--; }
+        else if (new_state == 'D') { j -= step_size; }
+        else { i -= step_size; }
+
+        if (cigar.size() == 0 && segment_len == 0) {
+             state = new_state; segment_len = step_size;
+        } else if (new_state == state) {
+            segment_len += step_size;
+        } else {
+            cigar.emplace_back(segment_len, state);
+            segment_len = step_size;
+            state = new_state;
+        }
+    }
+    
+    if (segment_len > 0) cigar.emplace_back(segment_len, state);
+    if (i > 0) cigar.emplace_back(i, 'S');
+    cigar.reverse();
+    
+    // [修正] 回傳 j 作為 Offset (Start Position)，而不是 sink.x (End Position)
+    return {j, cigar, best_score};
+}
 
 auto SmithWatermanCuda::align(std::string_view ref,
                               std::string_view alt,
@@ -285,67 +390,71 @@ auto SmithWatermanCuda::align(std::string_view ref,
     if (ref.empty() || alt.empty()) {
         return SWResult{};
     }
-	cudaFree(0);
 
     const int N = static_cast<int>(ref.size());
     const int M = static_cast<int>(alt.size());
 
-    // ---- device memory ----
-    char* d_ref  = nullptr;
-    char* d_alt  = nullptr;
-    int*  d_best = nullptr;
-    int2* d_sink = nullptr;
+    // Device pointers
+    char* d_ref = nullptr; char* d_alt = nullptr;
+    int* d_best = nullptr; int2* d_sink = nullptr;
+    int* d_temp_h = nullptr; int* d_temp_f = nullptr; int* d_temp_len_f = nullptr;
+    int8_t* d_trace = nullptr; // int8 Trace
 
+    // Malloc
     cudaMalloc(&d_ref,  N * sizeof(char));
     cudaMalloc(&d_alt,  M * sizeof(char));
     cudaMalloc(&d_best, sizeof(int));
     cudaMalloc(&d_sink, sizeof(int2));
+    cudaMalloc(&d_trace, (size_t)(N + 1) * (size_t)(M + 1) * sizeof(int8_t));
+
+    // See if it can use Shared Memory or not
+    int dev_id = 0; cudaGetDevice(&dev_id);
+    int max_smem = 0; cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, dev_id);
+    size_t needed_bytes = 3 * (N + 1) * sizeof(int);
+
+    bool use_smem = (needed_bytes <= max_smem);
+    size_t kernel_smem = use_smem ? needed_bytes : 0;
+    int* k_h = nullptr; int* k_f = nullptr; int* k_lf = nullptr;
+    
+    if (!use_smem) {
+        cudaMalloc(&d_temp_h, (N + 1) * sizeof(int));
+        cudaMalloc(&d_temp_f, (N + 1) * sizeof(int));
+        cudaMalloc(&d_temp_len_f, (N + 1) * sizeof(int));
+        k_h = d_temp_h; k_f = d_temp_f; k_lf = d_temp_len_f;
+        printf("Using Global Memory (Size: %zu bytes)\n", needed_bytes);
+    }
 
     cudaMemcpy(d_ref, ref.data(), N * sizeof(char), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_alt, alt.data(), M * sizeof(char), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_alt, alt.data(), M * sizeof(char), cudaMemcpyHostToDevice);    
 
     // ---- launch kernel ----
     dim3 grid(1);
     dim3 block(WARP_SIZE);
 
-    const size_t shared_bytes = (N + 1) * sizeof(int);
-    sw_warp_kernel<<<grid, block, shared_bytes>>>(
-        d_ref,
-        d_alt,
-        N,
-        M,
-        params.w_match,
-        params.w_mismatch,
-        params.w_open,
-        params.w_extend,
-        d_best,
-        d_sink);
+    sw_warp_kernel<<<grid, block, kernel_smem>>>(
+        d_ref, d_alt, N, M,
+        params.w_match, params.w_mismatch, params.w_open, params.w_extend,
+        d_best, d_sink, 
+        k_h, k_f, k_lf,
+        d_trace);
 
     CUDACHECKASYNC;
 
-    int  best_score = 0;
-    int2 sink       = make_int2(0, 0);
+    int best_score = 0;
+    int2 sink = make_int2(0,0);
+    std::vector<int8_t> h_trace((N + 1) * (M + 1));
 
     cudaMemcpy(&best_score, d_best, sizeof(int),  cudaMemcpyDeviceToHost);
     cudaMemcpy(&sink,       d_sink, sizeof(int2), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_trace.data(), d_trace, h_trace.size() * sizeof(int8_t), cudaMemcpyDeviceToHost);
 
-    cudaFree(d_ref);
-    cudaFree(d_alt);
-    cudaFree(d_best);
-    cudaFree(d_sink);
+    // Free Memory
+    cudaFree(d_ref); cudaFree(d_alt); cudaFree(d_best); cudaFree(d_sink); cudaFree(d_trace);
+    if (d_temp_h) cudaFree(d_temp_h);
+    if (d_temp_f) cudaFree(d_temp_f);
+    if (d_temp_len_f) cudaFree(d_temp_len_f);
 
-
-	printf("[SW CUDA DEBUG] best_score = %d\n", best_score);
-	printf("[SW CUDA DEBUG] sink (j,i) = (%d, %d)\n", sink.x, sink.y);
-	fflush(stdout);
-    // TODO:
-    //  0. Fixed aligmnet bug: 還沒找到為什麼有時候分數跟 baseline 不一樣
-    //  1. 根據 sink (最佳 j,i) 做 traceback，計算真正的 offset 與 CIGAR, return SWResult, 把 best_score / offset / cigar 填進去
-    //  2. 提升 GPU 利用率, 新增 batch align: 一次可以同時跑許多 align pair (ref vs. alt), 目前只用到 warp size 個 block 做一個 align pair
-    //  
-    //  3. XSIMD/XSIMD batch, baseline batch (thread), input: vector<string> ref, vector<string> alt, aligmnet pair ref[i] vs. alt[i]
-    //  
-    return SWResult{offset, cigar, best score};
+    return cpu_traceback_int8(N, M, sink, h_trace, best_score);
 }
 
 } // namespace biovoltron

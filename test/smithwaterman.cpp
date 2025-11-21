@@ -33,39 +33,63 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
 
   SECTION("Performance: Baseline vs. CUDA") 
   {
-    int truth_offset;
-    std::string truth_s;
-    int truth_score;
+      int truth_offset;
+      std::string truth_cigar;
+      int truth_score;
 
-    {
-      auto start = std::chrono::high_resolution_clock::now(); 
-      auto [offset, cigar, score] = biovoltron::SmithWaterman::align(ref, alt, biovoltron::SmithWaterman::ORIGINAL_DEFAULT);
-      auto end = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-      std::cout << "SmithWaterman time: " << duration << " us" << std::endl;
+      long long duration_baseline = 0;
+      long long duration_cuda = 0;
 
-      std::string s(cigar);
-      std::cout << "Offset = " << offset << "\n";
-      std::cout << "CIGAR = " << s << "\n";
-      std::cout << "SCORE = " << score << "\n";
+      //
+      // ===== CPU Smith-Waterman =====
+      //
+      {
+          auto start  = std::chrono::high_resolution_clock::now();
+          auto [offset1, cigar1, score1] =
+              biovoltron::SmithWaterman::align(ref, alt, biovoltron::SmithWaterman::ORIGINAL_DEFAULT);
+          auto end    = std::chrono::high_resolution_clock::now();
 
-      truth_offset = offset;
-      truth_s = s;
-      truth_score = score;
-    }
+          duration_baseline =
+              std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
-    {
-      auto start = std::chrono::high_resolution_clock::now(); 
-      auto [offset, cigar, score] = biovoltron::SmithWatermanCuda::align(ref, alt, biovoltron::SmithWatermanCuda::ORIGINAL_DEFAULT);
-      auto end = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-      std::cout << "SmithWaterman Cuda time: " << duration << " us" << std::endl;
+          std::cout << "SmithWaterman CPU time = "
+                    << duration_baseline << " us\n";
 
-      //std::string s(cigar);
-      //REQUIRE(offset == truth_offset);                // Should align from the beginning
-      //REQUIRE(std::string(cigar) == truth_s); // Expect perfect match over all bases
-      //REQUIRE(score == truth_score);
-    }
+          std::cout << "CPU Offset = " << offset1 << "\n";
+          std::cout << "CPU CIGAR  = " << cigar1 << "\n";
+          std::cout << "CPU SCORE  = " << score1 << "\n";
 
+          truth_offset = offset1;
+          truth_cigar  = cigar1;
+          truth_score  = score1;
+      }
+
+      //
+      // ===== CUDA Smith-Waterman =====
+      //
+      {
+          auto start  = std::chrono::high_resolution_clock::now();
+          auto [offset2, cigar2, score2] =
+              biovoltron::SmithWatermanCuda::align(ref, alt, biovoltron::SmithWatermanCuda::ORIGINAL_DEFAULT);
+          auto end    = std::chrono::high_resolution_clock::now();
+
+          duration_cuda =
+              std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+          std::cout << "SmithWaterman CUDA time = "
+                    << duration_cuda << " us\n";
+
+          // ====== correctness checks ======
+          CHECK(offset2 == truth_offset);
+          CHECK(score2 == truth_score);
+          CHECK(std::string(cigar2) == truth_cigar);
+
+          // ====== speedup ======
+          double speedup = static_cast<double>(duration_baseline) /
+                          static_cast<double>(duration_cuda);
+
+          std::cout << "Speedup (CPU / CUDA) = "
+                    << speedup << "x\n";
+      }
   }
 }

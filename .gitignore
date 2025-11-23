@@ -1,0 +1,33 @@
+# CMake build directories
+/build/
+/build_*/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+
+# 編譯產物
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.log
+
+# 編譯資料庫（看你要不要版控，如果不需要就忽略）
+compile_commands.json
+
+# 常見 IDE 設定檔
+.vscode/
+.idea/
+.DS_Store
+
+# Windows 下載檔案的安全標籤垃圾
+*:Zone.Identifier

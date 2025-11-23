@@ -10,7 +10,8 @@ fi
 
 LEN=$1
 SIM=$2
-OUTDIR="/mnt/ec/ness/max/sw_cuda/test/data"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+OUTDIR="${SCRIPT_DIR}/data"   # ==> <repo>/test/data
 mkdir -p "$OUTDIR"
 
 if ! [[ "$LEN" =~ ^[0-9]+$ ]] || ! [[ "$SIM" =~ ^[0-9]+$ ]]; then

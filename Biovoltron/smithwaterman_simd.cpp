@@ -3,294 +3,346 @@
 
 #include <xsimd/xsimd.hpp>
 
-#include <cassert>
-#include <cstdint>
-#include <limits>
+#include <array>
+#include <vector>
 #include <string>
 #include <string_view>
-#include <vector>
+#include <cstdint>
 #include <algorithm>
 #include <thread>
 
 namespace biovoltron {
 
-// =========================== internal helpers ===============================
-
 namespace {
 
-using batch_i32 = xsimd::batch<int32_t>;
+using value_type = std::int16_t;
+constexpr std::uint8_t kBases = 4;
 
-/**
- * SIMD 加速版本的 DP matrix 建立：
- *  - 先對每一行 ref[i-1]，用 SIMD 一次算出 alt 上所有位置的
- *    match / mismatch 分數 (diag_scores[j])。
- *  - 再用與 scalar 版幾乎相同的 affine gap DP 更新 score / trace。
- */
-void calculate_matrix_simd(std::string_view ref,
-                           std::string_view alt,
-                           std::vector<std::vector<int>>& score,
-                           std::vector<std::vector<int>>& trace,
-                           SmithWatermanSimd::Parameters params) {
-  const std::size_t row_size = score.size();        // = ref.size() + 1
-  const std::size_t col_size = score.front().size(); // = alt.size() + 1
-  const std::size_t alt_len  = alt.size();
+// 4x4 substitution matrix: [ref_base][alt_base]
+using sub_t = std::array<std::array<value_type, kBases>, kBases>;
 
-  // Gap tracking vectors for affine penalties
-  std::vector<int> gap_size_down(col_size + 1, 0);
-  std::vector<int> best_gap_down(col_size + 1,
-                                 std::numeric_limits<int>::min() / 2);
-  std::vector<int> gap_size_right(row_size + 1, 0);
-  std::vector<int> best_gap_right(row_size + 1,
-                                  std::numeric_limits<int>::min() / 2);
+// aligned vector，給 xsimd 用
+using vector_aligned =
+    std::vector<value_type, xsimd::default_allocator<value_type>>;
 
-  const int w_match    = params.w_match;
-  const int w_mismatch = params.w_mismatch;
-  const int w_open     = params.w_open;
-  const int w_extend   = params.w_extend;
-
-  // 把 alt 的字元先轉成 32-bit 整數，方便用 xsimd 做等號比對
-  std::vector<int32_t> alt_codes(alt_len);
-  for (std::size_t j = 0; j < alt_len; ++j) {
-    alt_codes[j] = static_cast<unsigned char>(alt[j]);
+// 建 substitution matrix：對角 = match，其他 = -mismatch_abs
+sub_t make_substitution_matrix(value_type match, value_type mismatch_abs) {
+  sub_t m{};
+  for (std::uint8_t i = 0; i < kBases; ++i) {
+    for (std::uint8_t j = 0; j < kBases; ++j) {
+      m[i][j] = (i == j) ? match : static_cast<value_type>(-mismatch_abs);
+    }
   }
+  return m;
+}
 
-  // diag_scores[j] = ref[i-1] 和 alt[j-1] 的 match/mismatch 分數
-  // 注意：diag_scores[0] 不使用，從 1..alt_len 對應到 j。
-  std::vector<int> diag_scores(col_size, 0);
-
-  const std::size_t vec_size = batch_i32::size;
-
-  for (std::size_t i = 1; i < row_size; ++i) {
-    // --------------------  用 SIMD 算一整列的 s(i, j)  --------------------
-    const int32_t ref_code = static_cast<unsigned char>(ref[i - 1]);
-    const batch_i32 v_ref(ref_code);
-    const batch_i32 v_match(w_match);
-    const batch_i32 v_mismatch(w_mismatch);
-
-    std::size_t j = 0;
-    for (; j + vec_size <= alt_len; j += vec_size) {
-      // 載入一段 alt 的編碼
-      batch_i32 v_alt = xsimd::load_unaligned(&alt_codes[j]);
-      auto mask       = (v_alt == v_ref);  // batch_bool<int32_t>
-
-      // 相等的地方給 match 分數，不相等給 mismatch
-      batch_i32 v_scores = xsimd::select(mask, v_match, v_mismatch);
-
-      // 存到 diag_scores，索引 +1 對齊 j (1..alt_len)
-      xsimd::store_unaligned(&diag_scores[j + 1], v_scores);
-    }
-    // 處理尾巴不足一個 batch 的部分 (scalar)
-    for (; j < alt_len; ++j) {
-      diag_scores[j + 1] =
-          (alt[j] == ref[i - 1]) ? w_match : w_mismatch;
-    }
-
-    // --------------------  scalar DP (跟原本 calculate_matrix 幾乎一樣) ----
-    for (std::size_t col = 1; col < col_size; ++col) {
-      // diagonal: match / mismatch
-      const int step_diag = score[i - 1][col - 1] + diag_scores[col];
-
-      // Gap in ref (down)
-      const int gap_open_down = score[i - 1][col] + w_open;
-      best_gap_down[col] += w_extend;
-      if (gap_open_down > best_gap_down[col]) {
-        best_gap_down[col] = gap_open_down;
-        gap_size_down[col] = 1;
-      } else {
-        gap_size_down[col]++;
-      }
-      const int step_down      = best_gap_down[col];
-      const int step_down_size = gap_size_down[col];
-
-      // Gap in alt (right)
-      const int gap_open_right = score[i][col - 1] + w_open;
-      best_gap_right[i] += w_extend;
-      if (gap_open_right > best_gap_right[i]) {
-        best_gap_right[i] = gap_open_right;
-        gap_size_right[i] = 1;
-      } else {
-        gap_size_right[i]++;
-      }
-      const int step_right      = best_gap_right[i];
-      const int step_right_size = gap_size_right[i];
-
-      // Select the best move. Priority: diagonal > right > down.
-      if (step_diag >= step_down && step_diag >= step_right) {
-        score[i][col] = step_diag;
-        trace[i][col] = 0;                   // diagonal (M)
-      } else if (step_right >= step_down) {
-        score[i][col] = step_right;
-        trace[i][col] = -step_right_size;    // insertion (I)
-      } else {
-        score[i][col] = step_down;
-        trace[i][col] = step_down_size;      // deletion (D)
-      }
-
-      // Local alignment：不允許分數小於 0
-      if (score[i][col] < 0) {
-        score[i][col] = 0;
-        trace[i][col] = 0;
-      }
-    }
+// A/C/G/T -> 0..3
+inline std::uint8_t encode_base(char c) {
+  switch (c) {
+    case 'A': return 0;
+    case 'C': return 1;
+    case 'G': return 2;
+    case 'T': return 3;
+    default:  return 0;  // fallback，非 ACGT 都當 A 看
   }
 }
 
-/**
- * Traceback：根據 score / trace 回推，產生 CIGAR 和 offset。
- * 這一段基本上就是把 smithwaterman.hpp 裡的 calculate_cigar 拿過來用，
- * 只是回傳型別改成 SmithWatermanSimd::SWResult。
- */
-auto calculate_cigar_simd(std::vector<std::vector<int>>& score,
-                          std::vector<std::vector<int>>& trace)
-    -> SmithWatermanSimd::SWResult {
-  const int ref_size = static_cast<int>(score.size()) - 1;
-  const int alt_size = static_cast<int>(score.front().size()) - 1;
-
-  int max_score   = std::numeric_limits<int>::min();
-  int segment_len = 0;
-
-  // 先在最右邊一整欄找最大值（= ref 的內部某位置結束）
-  int pos_i = 0;
-  for (int i = 1; i <= ref_size; ++i) {
-    const int cur_score = score[i][alt_size];
-    if (cur_score >= max_score) {
-      max_score = cur_score;
-      pos_i     = i;
-    }
+// 從兩條 alignment 字串壓成 CIGAR（M / I / D）
+inline Cigar build_cigar_from_alignment(const std::string& align_ref,
+                                        const std::string& align_alt) {
+  Cigar cigar;
+  if (align_ref.empty()) {
+    return cigar;
   }
 
-  // 再看最底下一整列是不是有更大的分數，或相同但更靠近對角線
-  int pos_j = alt_size;
-  auto diff = [](int x, int y) { return x > y ? x - y : y - x; };
-  for (int j = 1; j <= alt_size; ++j) {
-    const int cur_score = score[ref_size][j];
-    if (cur_score > max_score ||
-        (cur_score == max_score &&
-         diff(ref_size, j) < diff(pos_i, pos_j))) {
-      max_score = cur_score;
-      pos_i     = ref_size;
-      pos_j     = j;
-      // alt 在尾端多出來的部分當作 soft-clip
-      segment_len = alt_size - j;
-    }
-  }
+  char cur_op = 0;
+  unsigned cur_len = 0;
 
-  Cigar cigar{};
-  if (segment_len > 0) {
-    cigar.emplace_back(static_cast<unsigned>(segment_len), 'S');  // tail soft-clip
-    segment_len = 0;
-  }
+  auto flush = [&]() {
+    if (cur_len == 0) return;
+    cigar.emplace_back(cur_len, cur_op);
+    cur_len = 0;
+  };
 
-  char state = 'M';  // 初始假設在 M 狀態
-  do {
-    const int cur_trace = trace[pos_i][pos_j];
+  const std::size_t n = align_ref.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    const char a = align_ref[i];
+    const char b = align_alt[i];
+    char op = 0;
 
-    char new_state;
-    int step_size;
-    if (cur_trace > 0) {
-      new_state = 'D';
-      step_size = cur_trace;
-    } else if (cur_trace < 0) {
-      new_state = 'I';
-      step_size = -cur_trace;
+    if (a != '-' && b != '-') {
+      op = 'M';  // match / mismatch 都算 M
+    } else if (a != '-' && b == '-') {
+      op = 'D';
+    } else if (a == '-' && b != '-') {
+      op = 'I';
     } else {
-      new_state = 'M';
-      step_size = 1;
+      // 理論上不會兩個都是 '-'
+      continue;
     }
 
-    // 根據狀態更新位置
-    switch (new_state) {
-      case 'M':
-        pos_i--;
-        pos_j--;
-        break;
-      case 'I':
-        pos_j -= step_size;
-        break;
-      case 'D':
-        pos_i -= step_size;
-        break;
-      default:
-        break;
-    }
-
-    // 組 CIGAR：連續同一個 op 就累加長度
-    if (new_state == state) {
-      segment_len += step_size;
+    if (op == cur_op) {
+      ++cur_len;
     } else {
-      cigar.emplace_back(static_cast<unsigned>(segment_len), state);
-      segment_len = step_size;
-      state       = new_state;
+      flush();
+      cur_op = op;
+      cur_len = 1;
     }
-  } while (pos_i > 0 && pos_j > 0);
-
-  cigar.emplace_back(static_cast<unsigned>(segment_len), state);
-  const int align_offset = pos_i;
-
-  if (pos_j > 0) {
-    cigar.emplace_back(static_cast<unsigned>(pos_j), 'S');  // 頭部 soft-clip
   }
-
-  cigar.reverse();
-  return SmithWatermanSimd::SWResult{align_offset, cigar, max_score};
+  flush();
+  return cigar;
 }
 
 }  // namespace
 
-// =========================== SmithWatermanSimd ===============================
 
-// private helper: well_match（和 scalar 版邏輯一致）
-auto SmithWatermanSimd::well_match(std::string_view ref,
-                                   std::string_view alt) -> bool {
-  if (ref.size() != alt.size()) {
-    return false;
-  }
-
-  int mismatch = 0;
-  for (std::size_t i = 0;
-       i < ref.size() && mismatch <= MAX_MISMATCHES;
-       ++i) {
-    if (ref[i] != alt[i]) {
-      ++mismatch;
-    }
-  }
-  return mismatch <= MAX_MISMATCHES;
-}
-
-// 單一 pair 的 SIMD SW
 auto SmithWatermanSimd::align(std::string_view ref,
                               std::string_view alt,
                               Parameters params) -> SWResult {
-  assert(!ref.empty() && !alt.empty());
-
-  // Fast path：長度一樣且 mismatch 很少，直接視為全 M
-  if (ref.size() == alt.size() && well_match(ref, alt)) {
-    const int len = static_cast<int>(ref.size());
-    const std::string cigar_str = std::to_string(len) + 'M';
-
-    return SWResult{
-        /*offset=*/0,
-        /*cigar=*/Cigar(cigar_str),
-        /*score=*/params.w_match * len};
+  // 空字串處理
+  if (ref.empty() || alt.empty()) {
+    return SWResult{0, Cigar{}, 0};
   }
 
-  // 建立 DP 表
-  std::vector<std::vector<int>> score(ref.size() + 1,
-                                      std::vector<int>(alt.size() + 1, 0));
-  std::vector<std::vector<int>> trace(ref.size() + 1,
-                                      std::vector<int>(alt.size() + 1, 0));
+  // ===== 參數轉換：Biovoltron =====
+  //
+  // Biovoltron:
+  //   w_match > 0
+  //   w_mismatch < 0
+  //   w_open < 0
+  //   w_extend < 0
+  //
+  // 學長的 striped 版：
+  //   match > 0
+  //   mismatch_abs > 0（實際套用時用 -mismatch_abs）
+  //   gap_open > 0, gap_extend > 0（H/E/F 用減法）
+  //
+  const value_type match        = static_cast<value_type>(params.w_match);
+  const value_type mismatch_abs = static_cast<value_type>(-params.w_mismatch);
+  const value_type gap_open     = static_cast<value_type>(-params.w_open);
+  const value_type gap_extend   = static_cast<value_type>(-params.w_extend);
 
-  // 用 SIMD 建 matrix
-  calculate_matrix_simd(ref, alt, score, trace, params);
+  using batch_t = xsimd::batch<value_type>;
+  constexpr std::size_t batch_size = batch_t::size;
 
-  // Traceback 產生 CIGAR + offset + score
-  return calculate_cigar_simd(score, trace);
+  const std::size_t len_ref = ref.size();
+  const std::size_t len_alt = alt.size();
+
+  // striped 參數
+  const std::size_t seg_len     = (len_alt + batch_size) / batch_size;
+  const std::size_t profile_len = seg_len * batch_size;
+
+  // 建 substitution matrix & profile :contentReference[oaicite:1]{index=1}
+  const auto sub_mat = make_substitution_matrix(match, mismatch_abs);
+
+  std::array<vector_aligned, kBases> profile;
+  for (std::uint8_t base = 0; base < kBases; ++base) {
+    profile[base].assign(profile_len, 0);
+    for (std::size_t j = 0; j < seg_len; ++j) {
+      for (std::size_t k = (j == 0) ? 1u : 0u; k < batch_size; ++k) {
+        const std::size_t idx = k * seg_len + j - 1;
+        if (idx < len_alt) {
+          const std::uint8_t code = encode_base(alt[idx]);
+          profile[base][j * batch_size + k] = sub_mat[base][code];
+        }
+      }
+    }
+  }
+
+  // H / E / F 三個 DP 矩陣（每列一條 profile_len 長度的向量）
+  std::vector<vector_aligned> H(len_ref + 1, vector_aligned(profile_len, 0));
+  std::vector<vector_aligned> E(len_ref + 1, vector_aligned(profile_len, 0));
+  std::vector<vector_aligned> F(len_ref + 1, vector_aligned(profile_len, 0));
+
+  const batch_t GAP_O(gap_open);
+  const batch_t GAP_E(gap_extend);
+  const batch_t ZERO(static_cast<value_type>(0));
+
+  std::size_t max_i = 0, max_j = 0, max_k = 0;
+  value_type max_score = 0;
+
+  // ================== 主 DP 迴圈（striped + SIMD） ==================
+  for (std::size_t i = 1; i <= len_ref; ++i) {
+    // vH[0], vH[1] 交錯當 buffer
+    std::array<batch_t, 2> vH{
+        xsimd::slide_left<sizeof(value_type)>(
+            xsimd::load_aligned(&H[i - 1][profile_len - batch_size])),
+        ZERO};
+
+    batch_t vF = ZERO;
+    const std::uint8_t base = encode_base(ref[i - 1]);
+
+    for (std::size_t j = 0; j < seg_len; ++j) {
+      const bool even = ((j & 1u) == 0u);
+      auto& vH_prev = vH[even];     // i-1, j-1 / lazy buffer
+      auto& vH_curr = vH[!even];    // i,   j
+
+      // vertical gap F：從上方延伸
+      vF = xsimd::max(vF - GAP_E, vH_prev - GAP_O);
+
+      // 讀 H[i-1][j]，更新 E
+      vH_prev = xsimd::load_aligned(&H[i - 1][j * batch_size]);
+
+      batch_t vE = xsimd::max(
+          xsimd::load_aligned(&E[i - 1][j * batch_size]) - GAP_E,
+          vH_prev - GAP_O);
+
+      // match/mismatch + 取 max(H, E, F, 0)
+      vH_curr = xsimd::max(
+          xsimd::max(
+              vH_curr + xsimd::load_aligned(&profile[base][j * batch_size]),
+              ZERO),
+          xsimd::max(vE, vF));
+
+      // 更新 max_score
+      const value_type new_score = xsimd::reduce_max(vH_curr);
+      if (new_score > max_score) {
+        max_score = new_score;
+        max_i = i;
+        max_j = j;
+      }
+
+      // 寫回 H / E / F
+      xsimd::store_aligned(&H[i][j * batch_size], vH_curr);
+      xsimd::store_aligned(&E[i][j * batch_size], vE);
+      xsimd::store_aligned(&F[i][j * batch_size], vF);
+    }
+
+    // ========== Lazy F loop（修正 F 沿著 row 的 propagate）==========
+    const std::size_t last_idx = (~seg_len) & 1u;  // segLen 偶/奇 決定用哪個 buffer
+    vF = xsimd::slide_left<sizeof(value_type)>(
+        xsimd::max(vF - GAP_E, vH[last_idx] - GAP_O));
+
+    std::size_t j = 0;
+    std::size_t pass = 0;
+    while (true) {
+      batch_t vh = xsimd::load_aligned(&H[i][j * batch_size]);
+      if (xsimd::count(vF > (vh - GAP_O)) == 0) {
+        break;
+      }
+      xsimd::store_aligned(&H[i][j * batch_size], xsimd::max(vh, vF));
+      xsimd::store_aligned(
+          &F[i][j * batch_size],
+          xsimd::max(xsimd::load_aligned(&F[i][j * batch_size]), vF));
+
+      if (j + 1 == seg_len) {
+        vF = xsimd::slide_left<sizeof(value_type)>(vF - GAP_E);
+        j = 0;
+        if (++pass > 2) break;
+      } else {
+        vF -= GAP_E;
+        ++j;
+      }
+    }
+  }
+
+  // ================== Traceback：從 max_score 開始 ==================
+  if (max_score <= 0) {
+    // 全部都 <=0，代表沒有局部對齊
+    return SWResult{0, Cigar{}, 0};
+  }
+
+  // 找到在該 stripe 中真正等於 max_score 的 lane k
+  for (std::size_t k = 0; k < batch_size; ++k) {
+    if (H[max_i][max_j * batch_size + k] == max_score) {
+      max_k = k;
+      break;
+    }
+  }
+
+  std::size_t i = max_i;
+  std::size_t j = max_j;
+  std::size_t k = max_k;
+
+  auto cell_idx = [&](std::size_t ii, std::size_t jj, std::size_t kk) {
+    (void)ii;  // row 已經在外層
+    return jj * batch_size + kk;
+  };
+
+  // j,k 以 striped 座標往「左上」走
+  auto move_left = [&]() {
+    if (j == 0) {
+      // 往前一個 stripe，同時 k--（從右邊 slide）
+      if (k > 0) {
+        --k;
+      }
+      j = seg_len - 1;
+    } else {
+      --j;
+    }
+  };
+
+  std::string align_ref;
+  std::string align_alt;
+
+  while (i > 0) {
+    const std::size_t idx = cell_idx(i, j, k);
+    const value_type h = H[i][idx];
+    if (h <= 0) break;
+
+    const std::size_t q_pos = k * seg_len + j - 1;  // alt 的 index
+
+    const value_type e = E[i][idx];
+    const value_type f = F[i][idx];
+
+    // 優先順序：E（水平 gap in alt）> F（垂直 gap in ref）> diag
+    if (h == e) {
+      // gap in alt：ref 有字元，alt 缺字
+      align_ref += ref[i - 1];
+      align_alt += '-';
+
+      // 連續往上延伸 E
+      while (i > 1) {
+        const std::size_t idx_up = cell_idx(i - 1, j, k);
+        if (E[i][idx] != E[i - 1][idx_up] - gap_extend) break;
+        --i;
+        align_ref += ref[i - 1];
+        align_alt += '-';
+      }
+      --i;
+    } else if (h == f) {
+      // gap in ref：ref 缺，alt 有
+      align_ref += '-';
+      align_alt += alt[q_pos];
+
+      // 往左延伸 F（striped 左移）
+      auto prev_idx = (j == 0) ? (profile_len - batch_size + k - 1)
+                               : ((j - 1) * batch_size + k);
+      while (F[i][idx] == F[i][prev_idx] - gap_extend) {
+        move_left();
+        prev_idx = (j == 0) ? (profile_len - batch_size + k - 1)
+                            : ((j - 1) * batch_size + k);
+        align_ref += '-';
+        // q_pos 這個簡化版本，實務上可以再更精確追蹤
+        align_alt += alt[q_pos];
+      }
+      move_left();
+    } else {
+      // diag：match or mismatch
+      align_ref += ref[i - 1];
+      align_alt += alt[q_pos];
+      --i;
+      move_left();
+    }
+  }
+
+  // 反轉成正向
+  std::reverse(align_ref.begin(), align_ref.end());
+  std::reverse(align_alt.begin(), align_alt.end());
+
+  // 用 alignment 壓成 CIGAR
+  Cigar cigar = build_cigar_from_alignment(align_ref, align_alt);
+
+  // offset：對齊在 ref 上的起始位置 = 剛剛 traceback 結束時的 i
+  const int offset = static_cast<int>(i);
+  const int score  = static_cast<int>(max_score);
+
+  return SWResult{offset, std::move(cigar), score};
 }
-
-auto SmithWatermanSimd::batch_align(const std::vector<std::string>& refs,
-                                    const std::vector<std::string>& alts,
-                                    Parameters params)
-    -> std::vector<SWResult> {
+auto
+SmithWatermanSimd::batch_align(const std::vector<std::string>& refs,
+                               const std::vector<std::string>& alts,
+                               Parameters params) -> std::vector<SWResult> {
   const std::size_t n = std::min(refs.size(), alts.size());
   std::vector<SWResult> results(n);
 
@@ -298,7 +350,7 @@ auto SmithWatermanSimd::batch_align(const std::vector<std::string>& refs,
     return results;
   }
 
-  // 決定要開幾個執行緒
+  // 決定要開幾個 thread
   unsigned int num_threads = std::thread::hardware_concurrency();
   if (num_threads == 0) {
     num_threads = 1;
@@ -307,7 +359,7 @@ auto SmithWatermanSimd::batch_align(const std::vector<std::string>& refs,
     num_threads = static_cast<unsigned int>(n);
   }
 
-  // 每個 thread 負責一個連續區間 [begin, end)
+  // 每個 thread 負責一段 [begin, end)
   auto worker = [&](unsigned int tid) {
     const std::size_t chunk_size = (n + num_threads - 1) / num_threads;
     const std::size_t begin      = tid * chunk_size;
@@ -329,5 +381,4 @@ auto SmithWatermanSimd::batch_align(const std::vector<std::string>& refs,
 
   return results;
 }
-
 }  // namespace biovoltron

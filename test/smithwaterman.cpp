@@ -367,7 +367,7 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
     if (alt.size() > 1000) alt.resize(1000);
 
     // Define benchmark parameters
-    std::vector<int> batch_sizes = {100, 1000, 5000};
+    std::vector<int> batch_sizes = {1, 10, 100, 1000, 5000};
     std::vector<unsigned int> thread_counts = {1, 2, 4, 8, 16};
     
     // Cap thread counts by hardware concurrency
@@ -384,12 +384,12 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
     if (valid_thread_counts.empty()) valid_thread_counts.push_back(1);
 
     // Print Table Header
-    std::cout << "\n====================================================================================================\n";
-    std::cout << "                                Smith-Waterman Performance Benchmark\n";
-    std::cout << "====================================================================================================\n";
-    printf("%-10s | %-10s | %-15s | %-15s | %-15s | %-15s\n", 
-           "Batch Size", "Threads", "Baseline (us)", "SIMD (us)", "CUDA (us)", "Speedup (Base/CUDA)");
-    std::cout << "----------------------------------------------------------------------------------------------------\n";
+    std::cout << "\n======================================================================================================================\n";
+    std::cout << "                                      Smith-Waterman Performance Benchmark\n";
+    std::cout << "======================================================================================================================\n";
+    printf("%-10s | %-10s | %-15s | %-15s | %-15s | %-20s | %-20s\n", 
+           "Batch Size", "Threads", "Baseline (us)", "SIMD (us)", "CUDA (us)", "Speedup (Base/SIMD)", "Speedup (Base/CUDA)");
+    std::cout << "----------------------------------------------------------------------------------------------------------------------\n";
 
     for (int batch_size : batch_sizes) {
         // Prepare Batch Data
@@ -434,9 +434,15 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
                 speedup_cuda = static_cast<double>(baseline_result.duration_us) / static_cast<double>(duration_cuda);
             }
 
+            // Calculate Speedup (Baseline / SIMD)
+            double speedup_simd = 0.0;
+            if (simd_result.duration_us > 0) {
+                speedup_simd = static_cast<double>(baseline_result.duration_us) / static_cast<double>(simd_result.duration_us);
+            }
+
             // Print Row
-            printf("%-10d | %-10u | %-15lld | %-15lld | %-15lld | %-15.2fx\n", 
-                   batch_size, num_threads, baseline_result.duration_us, simd_result.duration_us, duration_cuda, speedup_cuda);
+            printf("%-10d | %-10u | %-15lld | %-15lld | %-15lld | %-20.2fx | %-20.2fx\n", 
+                   batch_size, num_threads, baseline_result.duration_us, simd_result.duration_us, duration_cuda, speedup_simd, speedup_cuda);
             
             // Correctness Checks (Sample)
             if (batch_size > 0) {
@@ -444,7 +450,7 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
                 CHECK(std::abs(simd_result.results[0].score - baseline_result.results[0].score) <= 20);
             }
         }
-        std::cout << "----------------------------------------------------------------------------------------------------\n";
+        std::cout << "----------------------------------------------------------------------------------------------------------------------\n";
     }
   }
 

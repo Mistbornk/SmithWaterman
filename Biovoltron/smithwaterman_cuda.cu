@@ -73,8 +73,8 @@ struct AlignmentResult
     AlignmentResult(int s, int jj, int ii) : score(s), j(jj), i(ii) {}
 };
 
-__global__
-void sw_warp_kernel(const char* __restrict__ ref,
+__device__ __forceinline__
+void sw_warp_device(const char* __restrict__ ref,
                     const char* __restrict__ alt,
                     int N,                   // ref length
                     int M,                   // alt length
@@ -84,30 +84,16 @@ void sw_warp_kernel(const char* __restrict__ ref,
                     int gap_extend,       // horizontal gaps
                     int* __restrict__ best_score_out,
                     int2* __restrict__ sink_out,
-                    int* __restrict__ global_temp_h,
-                    int* __restrict__ global_temp_f,
-                    int* __restrict__ global_temp_len_f,
-                    int8_t* __restrict__ trace)
+                    int* __restrict__ temp_h,
+                    int* __restrict__ temp_f,
+                    int* __restrict__ temp_len_f,
+                    int8_t* __restrict__ trace,
+                    int trace_stride)
 {
     // -infinite
     const int NEG_INF = INT_MIN / 2;
     // thread id (1-indexed)
     const unsigned int lane = warp_tid();
-
-    extern __shared__ int smem[];
-    int* temp_h;
-    int* temp_f;
-    int* temp_len_f;
-
-    if (global_temp_h == nullptr) {
-        temp_h = smem;
-        temp_f = smem + (N + 1);
-        temp_len_f = smem + 2 * (N + 1);
-    } else {
-        temp_h = global_temp_h;
-        temp_f = global_temp_f;
-        temp_len_f = global_temp_len_f;
-    }
 
     for (int j = lane; j <= N; j += WARP_SIZE) {
         temp_h[j]     = 0; 
@@ -115,7 +101,7 @@ void sw_warp_kernel(const char* __restrict__ ref,
         temp_len_f[j] = 0;
     }
 
-    __syncthreads();
+    __syncwarp();
 
     // H(i-1,j), H(i,j-1), H(i-1,j-1), current score
     int h_top  = 0, h_left = 0, h_diag = 0, h_val  = 0;  
@@ -261,7 +247,7 @@ void sw_warp_kernel(const char* __restrict__ ref,
                         trace_val = (int8_t)(l);  // Positive for Up/Deletion
                     }
 
-                    trace[size_t(j) * (M + 1) + i] = trace_val;
+                    trace[size_t(j) * trace_stride + i] = trace_val;
 
                     if (wi == WARP_SIZE) {
                         temp_h[j - 1] = h_val;
@@ -326,6 +312,109 @@ void sw_warp_kernel(const char* __restrict__ ref,
         sink_out->x     = best_j;  // row in ref
         sink_out->y     = best_i;  // column in alt
     }
+}
+
+__global__
+void sw_warp_kernel(const char* __restrict__ ref,
+                    const char* __restrict__ alt,
+                    int N,                   // ref length
+                    int M,                   // alt length
+                    int match_score,
+                    int mismatch_score,
+                    int gap_open,        // vertical gaps
+                    int gap_extend,       // horizontal gaps
+                    int* __restrict__ best_score_out,
+                    int2* __restrict__ sink_out,
+                    int* __restrict__ global_temp_h,
+                    int* __restrict__ global_temp_f,
+                    int* __restrict__ global_temp_len_f,
+                    int8_t* __restrict__ trace)
+{
+    extern __shared__ int smem[];
+    int* temp_h;
+    int* temp_f;
+    int* temp_len_f;
+
+    if (global_temp_h == nullptr) {
+        temp_h = smem;
+        temp_f = smem + (N + 1);
+        temp_len_f = smem + 2 * (N + 1);
+    } else {
+        temp_h = global_temp_h;
+        temp_f = global_temp_f;
+        temp_len_f = global_temp_len_f;
+    }
+
+    sw_warp_device(ref, alt, N, M, match_score, mismatch_score, gap_open, gap_extend,
+                   best_score_out, sink_out, temp_h, temp_f, temp_len_f, trace, M + 1);
+}
+
+__global__
+void sw_batch_kernel(const char* __restrict__ all_refs,
+                     const char* __restrict__ all_alts,
+                     const int* __restrict__ ref_offsets,
+                     const int* __restrict__ alt_offsets,
+                     const int* __restrict__ ref_lengths,
+                     const int* __restrict__ alt_lengths,
+                     int num_pairs,
+                     int match_score,
+                     int mismatch_score,
+                     int gap_open,
+                     int gap_extend,
+                     int* __restrict__ all_best_scores,
+                     int2* __restrict__ all_sinks,
+                     int8_t* __restrict__ all_traces,
+                     const long long* __restrict__ trace_offsets,
+                     int* __restrict__ global_temp_buffer, // Large buffer for temp arrays if needed
+                     int max_ref_len)
+{
+    int pair_idx = blockIdx.x;
+    if (pair_idx >= num_pairs) return;
+
+    int N = ref_lengths[pair_idx];
+    int M = alt_lengths[pair_idx];
+
+    const char* ref = all_refs + ref_offsets[pair_idx];
+    const char* alt = all_alts + alt_offsets[pair_idx];
+
+    int* best_score_out = all_best_scores + pair_idx;
+    int2* sink_out = all_sinks + pair_idx;
+    int8_t* trace = all_traces + trace_offsets[pair_idx];
+
+    // Shared memory or global memory for temp arrays
+    extern __shared__ int smem[];
+    int* temp_h;
+    int* temp_f;
+    int* temp_len_f;
+
+    // Calculate pointers for temp arrays
+    // If max_ref_len is small enough, use shared memory. 
+    // Otherwise use global memory buffer.
+    // For simplicity in this implementation, we assume we pass enough smem if possible,
+    // or we use global memory if provided.
+    
+    // Check if we have enough shared memory
+    // We need 3 * (N + 1) * sizeof(int)
+    // The kernel launch should have configured dynamic shared memory size.
+    // However, since N varies per block, we can't easily switch between smem and global per block 
+    // unless we know the max N fits in smem.
+    
+    // Strategy: Use global_temp_buffer if provided (non-null), otherwise assume smem.
+    // global_temp_buffer should be sized: num_pairs * 3 * (max_N + 1)
+    
+    if (global_temp_buffer != nullptr) {
+        long long offset = (long long)pair_idx * 3 * (max_ref_len + 1);
+        temp_h = global_temp_buffer + offset;
+        temp_f = temp_h + (max_ref_len + 1);
+        temp_len_f = temp_f + (max_ref_len + 1);
+    } else {
+        temp_h = smem;
+        temp_f = smem + (N + 1);
+        temp_len_f = smem + 2 * (N + 1);
+    }
+
+    sw_warp_device(ref, alt, N, M, match_score, mismatch_score, gap_open, gap_extend,
+                   best_score_out, sink_out, temp_h, temp_f, temp_len_f, trace, M + 1);
 }
 
 } // anonymous namespace
@@ -454,6 +543,163 @@ auto SmithWatermanCuda::align(std::string_view ref,
     if (d_temp_len_f) cudaFree(d_temp_len_f);
 
     return cpu_traceback_int8(N, M, sink, h_trace, best_score);
+}
+
+auto SmithWatermanCuda::batch_align(const std::vector<std::string>& refs,
+                                    const std::vector<std::string>& alts,
+                                    Parameters params)
+    -> std::vector<SWResult>
+{
+    size_t num_pairs = std::min(refs.size(), alts.size());
+    if (num_pairs == 0) return {};
+
+    std::vector<SWResult> results(num_pairs);
+
+    // 1. Prepare host data
+    std::vector<int> h_ref_offsets(num_pairs);
+    std::vector<int> h_alt_offsets(num_pairs);
+    std::vector<int> h_ref_lengths(num_pairs);
+    std::vector<int> h_alt_lengths(num_pairs);
+    std::vector<long long> h_trace_offsets(num_pairs);
+
+    std::string all_refs_concat;
+    std::string all_alts_concat;
+    
+    // Pre-calculate total sizes to reserve memory
+    size_t total_ref_len = 0;
+    size_t total_alt_len = 0;
+    long long total_trace_size = 0;
+    int max_ref_len = 0;
+
+    for (size_t i = 0; i < num_pairs; ++i) {
+        h_ref_offsets[i] = total_ref_len;
+        h_alt_offsets[i] = total_alt_len;
+        h_ref_lengths[i] = refs[i].size();
+        h_alt_lengths[i] = alts[i].size();
+        
+        total_ref_len += refs[i].size();
+        total_alt_len += alts[i].size();
+        
+        h_trace_offsets[i] = total_trace_size;
+        total_trace_size += (long long)(refs[i].size() + 1) * (alts[i].size() + 1);
+
+        if ((int)refs[i].size() > max_ref_len) {
+            max_ref_len = (int)refs[i].size();
+        }
+    }
+
+    all_refs_concat.reserve(total_ref_len);
+    all_alts_concat.reserve(total_alt_len);
+    for (size_t i = 0; i < num_pairs; ++i) {
+        all_refs_concat += refs[i];
+        all_alts_concat += alts[i];
+    }
+
+    // 2. Allocate device memory
+    char *d_all_refs, *d_all_alts;
+    int *d_ref_offsets, *d_alt_offsets, *d_ref_lengths, *d_alt_lengths;
+    int *d_best_scores;
+    int2 *d_sinks;
+    int8_t *d_all_traces;
+    long long *d_trace_offsets;
+    int *d_global_temp = nullptr;
+
+    cudaMalloc(&d_all_refs, total_ref_len * sizeof(char));
+    cudaMalloc(&d_all_alts, total_alt_len * sizeof(char));
+    cudaMalloc(&d_ref_offsets, num_pairs * sizeof(int));
+    cudaMalloc(&d_alt_offsets, num_pairs * sizeof(int));
+    cudaMalloc(&d_ref_lengths, num_pairs * sizeof(int));
+    cudaMalloc(&d_alt_lengths, num_pairs * sizeof(int));
+    cudaMalloc(&d_best_scores, num_pairs * sizeof(int));
+    cudaMalloc(&d_sinks, num_pairs * sizeof(int2));
+    cudaMalloc(&d_all_traces, total_trace_size * sizeof(int8_t));
+    cudaMalloc(&d_trace_offsets, num_pairs * sizeof(long long));
+
+    // Check shared memory availability
+    int dev_id = 0; cudaGetDevice(&dev_id);
+    int max_smem = 0; cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, dev_id);
+    
+    // Needed shared memory per block: 3 * (max_ref_len + 1) * sizeof(int)
+    size_t needed_smem = 3 * (max_ref_len + 1) * sizeof(int);
+    bool use_smem = (needed_smem <= (size_t)max_smem);
+    size_t kernel_smem = use_smem ? needed_smem : 0;
+
+    if (!use_smem) {
+        // Allocate global temp buffer
+        // Size: num_pairs * 3 * (max_ref_len + 1) * sizeof(int)
+        // Note: This could be huge. 
+        size_t temp_buffer_size = num_pairs * needed_smem;
+        cudaMalloc(&d_global_temp, temp_buffer_size);
+        // printf("Batch: Using Global Memory for temp buffers (Size: %zu bytes)\n", temp_buffer_size);
+    }
+
+    // 3. Copy data to device
+    cudaMemcpy(d_all_refs, all_refs_concat.data(), total_ref_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_all_alts, all_alts_concat.data(), total_alt_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_offsets, h_ref_offsets.data(), num_pairs * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_alt_offsets, h_alt_offsets.data(), num_pairs * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_lengths, h_ref_lengths.data(), num_pairs * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_alt_lengths, h_alt_lengths.data(), num_pairs * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_trace_offsets, h_trace_offsets.data(), num_pairs * sizeof(long long), cudaMemcpyHostToDevice);
+
+    // 4. Launch kernel
+    // One block per pair
+    dim3 grid(num_pairs);
+    dim3 block(WARP_SIZE); 
+
+    sw_batch_kernel<<<grid, block, kernel_smem>>>(
+        d_all_refs, d_all_alts,
+        d_ref_offsets, d_alt_offsets,
+        d_ref_lengths, d_alt_lengths,
+        num_pairs,
+        params.w_match, params.w_mismatch, params.w_open, params.w_extend,
+        d_best_scores, d_sinks, d_all_traces, d_trace_offsets,
+        d_global_temp, max_ref_len
+    );
+    
+    CUDACHECKASYNC;
+
+    // 5. Copy results back
+    std::vector<int> h_best_scores(num_pairs);
+    std::vector<int2> h_sinks(num_pairs);
+    std::vector<int8_t> h_all_traces(total_trace_size);
+
+    cudaMemcpy(h_best_scores.data(), d_best_scores, num_pairs * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sinks.data(), d_sinks, num_pairs * sizeof(int2), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_all_traces.data(), d_all_traces, total_trace_size * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // 6. Traceback on CPU
+    for (size_t i = 0; i < num_pairs; ++i) {
+        int N = h_ref_lengths[i];
+        int M = h_alt_lengths[i];
+        int2 sink = h_sinks[i];
+        int score = h_best_scores[i];
+        long long trace_start = h_trace_offsets[i];
+        
+        // Extract trace for this pair
+        // The trace is stored contiguously for each pair
+        // We can pass a pointer to the start of the trace for this pair
+        // But cpu_traceback_int8 expects a vector. 
+        // We can overload cpu_traceback_int8 or just copy.
+        // Copying is safer for now to avoid changing the helper signature too much or doing pointer arithmetic there.
+        // Actually, cpu_traceback_int8 takes const std::vector<int8_t>& trace.
+        // We can just construct a vector from the pointer range.
+        
+        std::vector<int8_t> pair_trace(h_all_traces.begin() + trace_start, 
+                                       h_all_traces.begin() + trace_start + (long long)(N + 1) * (M + 1));
+        
+        results[i] = cpu_traceback_int8(N, M, sink, pair_trace, score);
+    }
+
+    // 7. Free memory
+    cudaFree(d_all_refs); cudaFree(d_all_alts);
+    cudaFree(d_ref_offsets); cudaFree(d_alt_offsets);
+    cudaFree(d_ref_lengths); cudaFree(d_alt_lengths);
+    cudaFree(d_best_scores); cudaFree(d_sinks);
+    cudaFree(d_all_traces); cudaFree(d_trace_offsets);
+    if (d_global_temp) cudaFree(d_global_temp);
+
+    return results;
 }
 
 } // namespace biovoltron

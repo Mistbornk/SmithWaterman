@@ -385,5 +385,90 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
               << gcups << " GCUPS\n";
   }
 
+  SECTION("Performance: Batch baseline(thread) vs. CUDA batch")
+  {
+    // ----- 準備 Batch 資料 -----
+    const int BATCH_SIZE = 100; 
+    std::cout << "\n[Batch] Running CUDA Batch with " << BATCH_SIZE << " pairs...\n";
+
+    std::vector<std::string> batch_refs(BATCH_SIZE, ref);
+    std::vector<std::string> batch_alts(BATCH_SIZE, alt);
+
+    // 統一用同一組 scoring 參數
+    SmithWatermanCuda::Parameters params{
+        SmithWatermanCuda::ORIGINAL_DEFAULT.w_match,
+        SmithWatermanCuda::ORIGINAL_DEFAULT.w_mismatch,
+        SmithWatermanCuda::ORIGINAL_DEFAULT.w_open,
+        SmithWatermanCuda::ORIGINAL_DEFAULT.w_extend};
+    
+    // Use SIMD params for baseline comparison
+    SmithWatermanSimd::Parameters simd_params{
+        params.w_match,
+        params.w_mismatch,
+        params.w_open,
+        params.w_extend};
+
+    // ----- baseline batch (scalar + 多執行緒) -----
+    auto baseline_batch = run_baseline_batch_thread(batch_refs, batch_alts, simd_params);
+
+    // ----- CUDA batch -----
+    auto start_cuda = std::chrono::high_resolution_clock::now();
+    auto cuda_results = SmithWatermanCuda::batch_align(batch_refs, batch_alts, params);
+    auto end_cuda = std::chrono::high_resolution_clock::now();
+    
+    long long duration_cuda = std::chrono::duration_cast<std::chrono::microseconds>(end_cuda - start_cuda).count();
+
+    // ----- 時間與 per-pair 統計 -----
+    std::cout << "[Batch] Baseline (thread, scalar) time = "
+              << baseline_batch.duration_us << " us\n";
+    std::cout << "[Batch] CUDA batch time                = "
+              << duration_cuda << " us\n";
+
+    std::cout << "[Batch] Avg per pair (baseline)        = "
+              << static_cast<double>(baseline_batch.duration_us) / BATCH_SIZE
+              << " us\n";
+    std::cout << "[Batch] Avg per pair (CUDA)            = "
+              << static_cast<double>(duration_cuda) / BATCH_SIZE
+              << " us\n";
+
+    // ----- 正確性檢查 -----
+    REQUIRE(cuda_results.size() == baseline_batch.results.size());
+    REQUIRE(cuda_results.size() == static_cast<std::size_t>(BATCH_SIZE));
+
+    // 抽查第一個
+    {
+      const auto& base0 = baseline_batch.results[0];
+      const auto& cuda0 = cuda_results[0];
+
+      CHECK(cuda0.score == base0.score);
+    }
+
+    // 抽查最後一個
+    {
+      const auto& base_last = baseline_batch.results.back();
+      const auto& cuda_last = cuda_results.back();
+
+      CHECK(cuda_last.score == base_last.score);
+    }
+
+    // ----- Speedup & GCUPS -----
+    double speedup_batch =
+        static_cast<double>(baseline_batch.duration_us) /
+        static_cast<double>(duration_cuda);
+
+    std::cout << "[Batch] Speedup (baseline(thread) / CUDA batch) = "
+              << speedup_batch << "x\n";
+
+    long long total_cells =
+        static_cast<long long>(ref.size()) *
+        static_cast<long long>(alt.size()) *
+        static_cast<long long>(BATCH_SIZE);
+
+    double gcups =
+        static_cast<double>(total_cells) / (duration_cuda * 1000.0); 
+    std::cout << "[Batch] CUDA batch performance = "
+              << gcups << " GCUPS\n";
+  }
+
 
 }

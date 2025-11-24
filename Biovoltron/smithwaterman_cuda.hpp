@@ -69,7 +69,7 @@ struct SmithWatermanCuda {
   
   static auto
   batch_align(
-        const std::vector<std::string>& refs,
+        const std::vector<std::string>& ref,
         const std::vector<std::string>& alts,
         Parameters params = NEW_SW_PARAMETERS)
     -> std::vector<SmithWatermanCuda::SWResult>;

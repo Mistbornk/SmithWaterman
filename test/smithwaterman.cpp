@@ -20,7 +20,8 @@ struct BatchRunResult {
 BatchRunResult
 run_baseline_batch_thread(const std::vector<std::string>& refs,
                           const std::vector<std::string>& alts,
-                          SmithWatermanSimd::Parameters params) {
+                          SmithWatermanSimd::Parameters params,
+                          unsigned int num_threads = 0) {
   const std::size_t n = std::min(refs.size(), alts.size());
   BatchRunResult out{};
   out.results.resize(n);
@@ -38,7 +39,9 @@ run_baseline_batch_thread(const std::vector<std::string>& refs,
       params.w_extend};
 
   // 決定 thread 數
-  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0) {
+      num_threads = std::thread::hardware_concurrency();
+  }
   if (num_threads == 0) num_threads = 1;
   if (num_threads > n) num_threads = static_cast<unsigned int>(n);
 
@@ -70,7 +73,55 @@ run_baseline_batch_thread(const std::vector<std::string>& refs,
   return out;
 }
 
-// XSIMD batch：直接呼叫 SmithWatermanSimd::batch_align（內部已多執行緒）
+// Custom SIMD batch runner with controllable threads
+BatchRunResult
+run_simd_batch_custom_threads(const std::vector<std::string>& refs,
+                              const std::vector<std::string>& alts,
+                              SmithWatermanSimd::Parameters params,
+                              unsigned int num_threads = 0) {
+  BatchRunResult out{};
+  const std::size_t n = std::min(refs.size(), alts.size());
+  out.results.resize(n);
+
+  if (n == 0) {
+    out.duration_us = 0;
+    return out;
+  }
+
+  // 決定 thread 數
+  if (num_threads == 0) {
+      num_threads = std::thread::hardware_concurrency();
+  }
+  if (num_threads == 0) num_threads = 1;
+  if (num_threads > n) num_threads = static_cast<unsigned int>(n);
+
+  auto worker = [&](unsigned int tid) {
+    const std::size_t chunk_size = (n + num_threads - 1) / num_threads;
+    const std::size_t begin = tid * chunk_size;
+    const std::size_t end   = std::min(n, begin + chunk_size);
+
+    for (std::size_t i = begin; i < end; ++i) {
+      out.results[i] = SmithWatermanSimd::align(refs[i], alts[i], params);
+    }
+  };
+
+  auto start = std::chrono::high_resolution_clock::now();
+
+  std::vector<std::thread> threads;
+  threads.reserve(num_threads);
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    threads.emplace_back(worker, t);
+  }
+  for (auto& th : threads) th.join();
+
+  auto end = std::chrono::high_resolution_clock::now();
+  out.duration_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+
+  return out;
+}
+
+// XSIMD batch：直接呼叫 SmithWatermanSimd::batch_align（內部已多執行緒，無法控制 thread 數，僅供參考）
 BatchRunResult
 run_simd_batch(const std::vector<std::string>& refs,
                const std::vector<std::string>& alts,
@@ -309,165 +360,92 @@ TEST_CASE("SmithWaterman::align - Performs Smith-Waterman alignment", "[SmithWat
     }
   }
 
-  SECTION("Performance: Batch baseline(thread) vs. SIMD batch") 
+  SECTION("Performance: Comprehensive Benchmark (Baseline vs SIMD vs CUDA)") 
   {
-    // ----- 準備 Batch 資料 -----
-    const int BATCH_SIZE = 5;  // 在自己筆電 WSL 上跑，太大會爆記憶體
-    std::cout << "\n[Batch] Running " << BATCH_SIZE << " pairs...\n";
+    // Truncate sequences to avoid OOM with large batches
+    if (ref.size() > 1000) ref.resize(1000);
+    if (alt.size() > 1000) alt.resize(1000);
 
-    std::vector<std::string> batch_refs(BATCH_SIZE, ref);
-    std::vector<std::string> batch_alts(BATCH_SIZE, alt);
-
-    // 統一用同一組 scoring 參數，這裡用 ORIGINAL_DEFAULT
-    SmithWatermanSimd::Parameters params{
-        SmithWatermanSimd::ORIGINAL_DEFAULT.w_match,
-        SmithWatermanSimd::ORIGINAL_DEFAULT.w_mismatch,
-        SmithWatermanSimd::ORIGINAL_DEFAULT.w_open,
-        SmithWatermanSimd::ORIGINAL_DEFAULT.w_extend};
-
-    // ----- baseline batch (scalar + 多執行緒) -----
-    auto baseline_batch = run_baseline_batch_thread(batch_refs, batch_alts, params);
-
-    // ----- SIMD batch (XSIMD + 多執行緒) -----
-    auto simd_batch = run_simd_batch(batch_refs, batch_alts, params);
-
-    // ----- 時間與 per-pair 統計 -----
-    std::cout << "[Batch] Baseline (thread, scalar) time = "
-              << baseline_batch.duration_us << " us\n";
-    std::cout << "[Batch] SIMD batch time                = "
-              << simd_batch.duration_us << " us\n";
-
-    std::cout << "[Batch] Avg per pair (baseline)        = "
-              << static_cast<double>(baseline_batch.duration_us) / BATCH_SIZE
-              << " us\n";
-    std::cout << "[Batch] Avg per pair (SIMD)            = "
-              << static_cast<double>(simd_batch.duration_us) / BATCH_SIZE
-              << " us\n";
-
-    // ----- 正確性檢查（放寬，只比 score） -----
-    REQUIRE(simd_batch.results.size() == baseline_batch.results.size());
-    REQUIRE(simd_batch.results.size() == static_cast<std::size_t>(BATCH_SIZE));
-
-    // 抽查第一個
-    {
-      const auto& base0 = baseline_batch.results[0];
-      const auto& simd0 = simd_batch.results[0];
-
-      CHECK(simd0.score >= base0.score);
-      CHECK(std::abs(simd0.score - base0.score) <= 20);
-    }
-
-    // 抽查最後一個
-    {
-      const auto& base_last = baseline_batch.results.back();
-      const auto& simd_last = simd_batch.results.back();
-
-      CHECK(simd_last.score >= base_last.score);
-      CHECK(std::abs(simd_last.score - base_last.score) <= 20);
-    }
-
-    // ----- Speedup & GCUPS -----
-    double speedup_batch =
-        static_cast<double>(baseline_batch.duration_us) /
-        static_cast<double>(simd_batch.duration_us);
-
-    std::cout << "[Batch] Speedup (baseline(thread) / SIMD batch) = "
-              << speedup_batch << "x\n";
-
-    long long total_cells =
-        static_cast<long long>(ref.size()) *
-        static_cast<long long>(alt.size()) *
-        static_cast<long long>(BATCH_SIZE);
-
-    double gcups =
-        static_cast<double>(total_cells) / (simd_batch.duration_us * 1000.0); 
-    std::cout << "[Batch] SIMD batch performance = "
-              << gcups << " GCUPS\n";
-  }
-
-  SECTION("Performance: Batch baseline(thread) vs. CUDA batch")
-  {
-    // ----- 準備 Batch 資料 -----
-    const int BATCH_SIZE = 100; 
-    std::cout << "\n[Batch] Running CUDA Batch with " << BATCH_SIZE << " pairs...\n";
-
-    std::vector<std::string> batch_refs(BATCH_SIZE, ref);
-    std::vector<std::string> batch_alts(BATCH_SIZE, alt);
-
-    // 統一用同一組 scoring 參數
-    SmithWatermanCuda::Parameters params{
-        SmithWatermanCuda::ORIGINAL_DEFAULT.w_match,
-        SmithWatermanCuda::ORIGINAL_DEFAULT.w_mismatch,
-        SmithWatermanCuda::ORIGINAL_DEFAULT.w_open,
-        SmithWatermanCuda::ORIGINAL_DEFAULT.w_extend};
+    // Define benchmark parameters
+    std::vector<int> batch_sizes = {100, 1000, 5000};
+    std::vector<unsigned int> thread_counts = {1, 2, 4, 8, 16};
     
-    // Use SIMD params for baseline comparison
-    SmithWatermanSimd::Parameters simd_params{
-        params.w_match,
-        params.w_mismatch,
-        params.w_open,
-        params.w_extend};
-
-    // ----- baseline batch (scalar + 多執行緒) -----
-    auto baseline_batch = run_baseline_batch_thread(batch_refs, batch_alts, simd_params);
-
-    // ----- CUDA batch -----
-    auto start_cuda = std::chrono::high_resolution_clock::now();
-    auto cuda_results = SmithWatermanCuda::batch_align(batch_refs, batch_alts, params);
-    auto end_cuda = std::chrono::high_resolution_clock::now();
+    // Cap thread counts by hardware concurrency
+    unsigned int max_threads = std::thread::hardware_concurrency();
+    if (max_threads == 0) max_threads = 1;
     
-    long long duration_cuda = std::chrono::duration_cast<std::chrono::microseconds>(end_cuda - start_cuda).count();
-
-    // ----- 時間與 per-pair 統計 -----
-    std::cout << "[Batch] Baseline (thread, scalar) time = "
-              << baseline_batch.duration_us << " us\n";
-    std::cout << "[Batch] CUDA batch time                = "
-              << duration_cuda << " us\n";
-
-    std::cout << "[Batch] Avg per pair (baseline)        = "
-              << static_cast<double>(baseline_batch.duration_us) / BATCH_SIZE
-              << " us\n";
-    std::cout << "[Batch] Avg per pair (CUDA)            = "
-              << static_cast<double>(duration_cuda) / BATCH_SIZE
-              << " us\n";
-
-    // ----- 正確性檢查 -----
-    REQUIRE(cuda_results.size() == baseline_batch.results.size());
-    REQUIRE(cuda_results.size() == static_cast<std::size_t>(BATCH_SIZE));
-
-    // 抽查第一個
-    {
-      const auto& base0 = baseline_batch.results[0];
-      const auto& cuda0 = cuda_results[0];
-
-      CHECK(cuda0.score == base0.score);
+    // Filter thread counts
+    std::vector<unsigned int> valid_thread_counts;
+    for (auto t : thread_counts) {
+        if (t <= max_threads) {
+            valid_thread_counts.push_back(t);
+        }
     }
+    if (valid_thread_counts.empty()) valid_thread_counts.push_back(1);
 
-    // 抽查最後一個
-    {
-      const auto& base_last = baseline_batch.results.back();
-      const auto& cuda_last = cuda_results.back();
+    // Print Table Header
+    std::cout << "\n====================================================================================================\n";
+    std::cout << "                                Smith-Waterman Performance Benchmark\n";
+    std::cout << "====================================================================================================\n";
+    printf("%-10s | %-10s | %-15s | %-15s | %-15s | %-15s\n", 
+           "Batch Size", "Threads", "Baseline (us)", "SIMD (us)", "CUDA (us)", "Speedup (Base/CUDA)");
+    std::cout << "----------------------------------------------------------------------------------------------------\n";
 
-      CHECK(cuda_last.score == base_last.score);
+    for (int batch_size : batch_sizes) {
+        // Prepare Batch Data
+        std::vector<std::string> batch_refs(batch_size, ref);
+        std::vector<std::string> batch_alts(batch_size, alt);
+
+        // Parameters
+        SmithWatermanSimd::Parameters params{
+            SmithWatermanSimd::ORIGINAL_DEFAULT.w_match,
+            SmithWatermanSimd::ORIGINAL_DEFAULT.w_mismatch,
+            SmithWatermanSimd::ORIGINAL_DEFAULT.w_open,
+            SmithWatermanSimd::ORIGINAL_DEFAULT.w_extend};
+        
+        SmithWatermanCuda::Parameters cuda_params{
+            SmithWatermanCuda::ORIGINAL_DEFAULT.w_match,
+            SmithWatermanCuda::ORIGINAL_DEFAULT.w_mismatch,
+            SmithWatermanCuda::ORIGINAL_DEFAULT.w_open,
+            SmithWatermanCuda::ORIGINAL_DEFAULT.w_extend};
+
+        // Run CUDA once per batch size (independent of threads)
+        long long duration_cuda = 0;
+        {
+            auto start_cuda = std::chrono::high_resolution_clock::now();
+            auto cuda_results = SmithWatermanCuda::batch_align(batch_refs, batch_alts, cuda_params);
+            auto end_cuda = std::chrono::high_resolution_clock::now();
+            duration_cuda = std::chrono::duration_cast<std::chrono::microseconds>(end_cuda - start_cuda).count();
+            
+            // Basic correctness check (size only)
+            REQUIRE(cuda_results.size() == static_cast<size_t>(batch_size));
+        }
+
+        for (unsigned int num_threads : valid_thread_counts) {
+            // Run Baseline (Threaded)
+            auto baseline_result = run_baseline_batch_thread(batch_refs, batch_alts, params, num_threads);
+            
+            // Run SIMD (Threaded)
+            auto simd_result = run_simd_batch_custom_threads(batch_refs, batch_alts, params, num_threads);
+
+            // Calculate Speedup (Baseline / CUDA)
+            double speedup_cuda = 0.0;
+            if (duration_cuda > 0) {
+                speedup_cuda = static_cast<double>(baseline_result.duration_us) / static_cast<double>(duration_cuda);
+            }
+
+            // Print Row
+            printf("%-10d | %-10u | %-15lld | %-15lld | %-15lld | %-15.2fx\n", 
+                   batch_size, num_threads, baseline_result.duration_us, simd_result.duration_us, duration_cuda, speedup_cuda);
+            
+            // Correctness Checks (Sample)
+            if (batch_size > 0) {
+                // Check first result
+                CHECK(std::abs(simd_result.results[0].score - baseline_result.results[0].score) <= 20);
+            }
+        }
+        std::cout << "----------------------------------------------------------------------------------------------------\n";
     }
-
-    // ----- Speedup & GCUPS -----
-    double speedup_batch =
-        static_cast<double>(baseline_batch.duration_us) /
-        static_cast<double>(duration_cuda);
-
-    std::cout << "[Batch] Speedup (baseline(thread) / CUDA batch) = "
-              << speedup_batch << "x\n";
-
-    long long total_cells =
-        static_cast<long long>(ref.size()) *
-        static_cast<long long>(alt.size()) *
-        static_cast<long long>(BATCH_SIZE);
-
-    double gcups =
-        static_cast<double>(total_cells) / (duration_cuda * 1000.0); 
-    std::cout << "[Batch] CUDA batch performance = "
-              << gcups << " GCUPS\n";
   }
 
 

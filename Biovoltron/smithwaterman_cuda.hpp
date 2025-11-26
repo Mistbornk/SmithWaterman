@@ -1,25 +1,28 @@
 #pragma once
 
+#include <cuda_runtime.h> 
 
 #include <Biovoltron/cigar.hpp>
 #include <cassert>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace biovoltron {
 
 /**
  * @ingroup align
  *
- * @brief Implements the CUDA Smith-Waterman local alignment algorithm with affine gap penalties .
- * 
+ * @brief Implements the CUDA Smith-Waterman local alignment algorithm with affine gap penalties.
  */
 struct SmithWatermanCuda {
 
   struct SWResult {
-      int offset; 
+      int   offset; 
       Cigar cigar;
-      int score;
+      int   score;
   };
 
   /**
@@ -28,10 +31,10 @@ struct SmithWatermanCuda {
    * Includes match reward, mismatch penalty, gap opening penalty, and gap extension penalty.
    */
   struct Parameters {
-    int w_match;   ///< Score for a match
-    int w_mismatch;///< Penalty for a mismatch
-    int w_open;    ///< Penalty for opening a gap
-    int w_extend;  ///< Penalty for extending a gap
+    int w_match;    ///< Score for a match
+    int w_mismatch; ///< Penalty for a mismatch
+    int w_open;     ///< Penalty for opening a gap
+    int w_extend;   ///< Penalty for extending a gap
   };
 
   /// Original BWA-style parameters: match = +3, mismatch = -1, gap = -1 - k
@@ -60,18 +63,30 @@ struct SmithWatermanCuda {
    * @param ref Reference sequence.
    * @param alt Alternate (query) sequence.
    * @param params Alignment parameters (optional).
-   * @return Pair of alignment offset and CIGAR string.
+   * @return SWResult{offset, cigar, score}.
    */
   static auto
   align(std::string_view ref, std::string_view alt,
         Parameters params = NEW_SW_PARAMETERS)
     -> SWResult; 
   
+  /**
+   * @brief Batched alignment of multiple (ref, alt) pairs on the GPU.
+   *
+   * Uses a multi-warp-per-block kernel: each warp processes one alignment pair,
+   * giving high occupancy even for small batch sizes.
+   */
   static auto
   batch_align(const std::vector<std::string>& refs,
               const std::vector<std::string>& alts,
               Parameters params = NEW_SW_PARAMETERS)
       -> std::vector<SWResult>;
+
+  /// Helper exposed mainly for testing / reuse in host code.
+  static SWResult
+  cpu_traceback_int8(int N, int M, int2 sink,
+                     const std::vector<int8_t>& trace,
+                     int best_score);
 };
 
 } // namespace biovoltron

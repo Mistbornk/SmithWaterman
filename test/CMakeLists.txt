@@ -1,37 +1,34 @@
-cmake_minimum_required(VERSION 3.18)
+add_library(sw-test-support STATIC support/backend.cpp)
+target_include_directories(sw-test-support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(sw-test-support PUBLIC biovoltron)
+target_compile_definitions(sw-test-support PUBLIC SW_HAS_CUDA=$<BOOL:${SW_ENABLE_CUDA}>)
 
-project(biovoltron-test CXX)
+if(BUILD_TESTING)
+  add_executable(biovoltron-test main.cpp smithwaterman.cpp)
+  target_link_libraries(biovoltron-test PRIVATE sw-test-support)
+  add_test(NAME sw.cpu COMMAND biovoltron-test "[cpu]")
+  set_tests_properties(sw.cpu PROPERTIES LABELS "cpu;correctness" TIMEOUT 60)
+  if(SW_ENABLE_CUDA)
+    add_executable(sw-cuda-test cuda_main.cpp)
+    target_link_libraries(sw-cuda-test PRIVATE sw-test-support)
+    add_test(NAME sw.cuda COMMAND sw-cuda-test)
+    set_tests_properties(sw.cuda PROPERTIES LABELS "cuda;correctness"
+      SKIP_RETURN_CODE 77 TIMEOUT 120 RESOURCE_LOCK sw_gpu)
+  endif()
+endif()
+if(SW_BUILD_BENCHMARKS)
+  add_executable(sw-benchmark benchmark.cpp)
+  target_link_libraries(sw-benchmark PRIVATE sw-test-support)
+endif()
 
-set(CMAKE_BUILD_TYPE Release)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-file(GLOB_RECURSE SOURCE_FILES
-  "${CMAKE_CURRENT_LIST_DIR}/*.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/../Biovoltron/*.cpp"
-)
-
-add_executable(biovoltron-test ${SOURCE_FILES})
-
-target_include_directories(biovoltron-test PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/.."
-  "${CMAKE_CURRENT_LIST_DIR}/../xsimd"
-)
-
-target_link_libraries(biovoltron-test PRIVATE biovoltron)
-
-target_compile_options(biovoltron-test
-  PRIVATE
-    -O3
-    -march=native
-    -DNDEBUG
-    -Wno-ignored-attributes
-)
-
-target_compile_definitions(biovoltron-test
-  PRIVATE DATA_PATH="${CMAKE_CURRENT_LIST_DIR}/data"
-)
-
-enable_testing()
-add_test(NAME biovoltron-run COMMAND biovoltron-test)
+# Optional Python tooling tests; no performance thresholds or long workloads.
+if(BUILD_TESTING AND SW_BUILD_BENCHMARKS)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME sw.tools COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_flow.py $<TARGET_FILE:sw-benchmark>)
+    set_tests_properties(sw.tools PROPERTIES LABELS "cpu;correctness;tools" TIMEOUT 30)
+  else()
+    message(STATUS "Python3 unavailable: sw.tools tests are not registered")
+  endif()
+endif()

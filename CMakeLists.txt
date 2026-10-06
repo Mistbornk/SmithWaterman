@@ -1,23 +1,31 @@
 cmake_minimum_required(VERSION 3.18)
+project(sw_cuda LANGUAGES CXX)
 
-project(sw_cuda LANGUAGES CXX CUDA)
-find_package(CUDAToolkit REQUIRED)
-
+option(SW_ENABLE_CUDA "Build CUDA backend and GPU tests" ON)
+option(SW_BUILD_BENCHMARKS "Build the standalone benchmark" ON)
+option(SW_NATIVE_ARCH "Optimize for the build machine (not portable)" OFF)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED True)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+find_package(Threads REQUIRED)
+if(SW_ENABLE_CUDA)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+endif()
 
-add_library(biovoltron STATIC
-    Biovoltron/smithwaterman_cuda.cu
-)
+add_library(biovoltron STATIC Biovoltron/smithwaterman_simd.cpp)
+target_include_directories(biovoltron PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(biovoltron PUBLIC Threads::Threads)
+if(SW_NATIVE_ARCH)
+  target_compile_options(biovoltron PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+endif()
+if(SW_ENABLE_CUDA)
+  target_sources(biovoltron PRIVATE Biovoltron/smithwaterman_cuda.cu)
+  target_link_libraries(biovoltron PUBLIC CUDA::cudart)
+  set_target_properties(biovoltron PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+endif()
 
-target_link_libraries(biovoltron
-    PUBLIC CUDA::cudart
-)
-
-target_include_directories(biovoltron PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-add_subdirectory(test)
+include(CTest)
+if(BUILD_TESTING OR SW_BUILD_BENCHMARKS)
+  add_subdirectory(test)
+endif()

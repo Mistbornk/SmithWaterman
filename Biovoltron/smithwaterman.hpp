@@ -20,6 +20,13 @@ namespace biovoltron {
  * generating a CIGAR string representing the optimal alignment path.
  */
 struct SmithWaterman {
+
+  struct SWResult {
+      int offset;
+      Cigar cigar;
+      int score;
+  };
+
   /**
    * @brief Parameters for scoring alignment.
    *
@@ -144,7 +151,7 @@ struct SmithWaterman {
    * @param trace Filled trace matrix
    * @return A pair containing the alignment offset and resulting CIGAR object
    */
-  static std::pair<int, Cigar>
+  static SWResult
   calculate_cigar(std::vector<std::vector<int>>& score,
                   std::vector<std::vector<int>>& trace) {
     const int ref_size = static_cast<int>(score.size()) - 1;
@@ -237,7 +244,7 @@ struct SmithWaterman {
       cigar.emplace_back(static_cast<unsigned>(pos_j), 'S');  // soft-clip at the beginning
 
     cigar.reverse();
-    return std::make_pair(align_offset, cigar);
+    return SWResult{align_offset, cigar, max_score};
   }
 
  public:
@@ -253,14 +260,14 @@ struct SmithWaterman {
    * @param params Alignment parameters (optional).
    * @return Pair of alignment offset and CIGAR string.
    */
-  static std::pair<int, Cigar>
+  static SWResult
   align(std::string_view ref, std::string_view alt,
         Parameters params = NEW_SW_PARAMETERS) {
     assert(!ref.empty() && !alt.empty());
 
     if (alt.size() == ref.size() && well_match(ref, alt)) {
       const std::string cigar_str = std::to_string(ref.size()) + std::string("M");
-      return std::make_pair(0, Cigar(cigar_str));  // C++20→C++17: 用 make_pair
+      return SWResult{0, Cigar(cigar_str), (int)params.w_match * (int)ref.size()};
     }
 
     std::vector<std::vector<int>> score(ref.size() + 1, std::vector<int>(alt.size() + 1, 0));

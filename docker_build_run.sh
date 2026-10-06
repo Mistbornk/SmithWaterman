@@ -1,10 +1,5 @@
-#!/bin/bash
-set -e
-
-# Build the Docker image
-echo "Building Docker image..."
-docker build -t smithwaterman-cuda .
-
-# Run the container to build and test
-echo "Running build and test inside Docker container..."
-docker run --gpus all --rm -v $(pwd):/app smithwaterman-cuda /bin/bash -c "cd build && cmake .. && make && ./test/biovoltron-test"
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+docker build -t smithwaterman-cuda "$repo_dir"
+docker run --gpus all --rm -v "${repo_dir}:/app" smithwaterman-cuda   /bin/bash -c 'cmake -S /app -B /tmp/sw-build -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/sw-build --parallel 2 && ctest --test-dir /tmp/sw-build --output-on-failure'
